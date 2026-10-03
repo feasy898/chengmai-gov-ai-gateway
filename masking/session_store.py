@@ -47,6 +47,11 @@ CREATE TABLE IF NOT EXISTS masking_map (
   PRIMARY KEY (session_id, placeholder)
 );
 CREATE INDEX IF NOT EXISTS idx_masking_map_first_seen ON masking_map(first_seen);
+CREATE TABLE IF NOT EXISTS session_owner (
+  session_id TEXT PRIMARY KEY,
+  dept       TEXT NOT NULL,          -- 会话属主部门（先到先得绑定，还原面授权用）
+  bound_at   TEXT NOT NULL           -- 定长 UTC ISO8601（common.timeutil.iso_utc）
+);
 """
 
 #: TTL 缺省（config/app.yaml session_ttl_h=24）
@@ -112,6 +117,49 @@ class SessionStore:
         self._last_activity[session_id] = time.monotonic()
         return self.registry.get(session_id)
 
+    # ── 会话属主（部门绑定；还原面授权用）────────────────────────
+    def bind_session(self, session_id: str, owner: str) -> str:
+        """首次使用即绑定会话属主（先到先得，持久化 ``session_owner`` 表）；返回当前属主。
+
+        审查加固：占位符映射只按 ``(session_id, placeholder)`` 主键存取、无部门
+        归属——任一部门 Key 借他部门 session_id 调还原面即可把占位符还原成原值。
+        属主表封死该跨部门还原链：首次使用（/v1/chat、/internal/anonymize）即
+        绑定，此后只要会话仍有映射行，他部门访问一律拒绝。
+
+        属主行生命周期（与 :meth:`cleanup` 同口径，防随机 session id 喷洒使
+        ``session_owner`` 表无界增长）：**与该会话的映射行同生共死，且以一个
+        TTL 为下限**——映射行全数过期/删除后，属主绑定在其 ``bound_at`` 早于
+        TTL 截断时一并清除。刚绑定、尚未产生映射行的会话（干净文本首次请求）
+        不会被下一轮 cleanup 立即解除绑定（先到先得承诺保持一个 TTL 的窗口）；
+        无映射行的会话本无还原物，属主行被清后跨部门还原面仍为零；进程内
+        ``registry._owners`` 视图亦随 LRU 换出丢失（落库为准）。
+        """
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+        with self._sql_lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO session_owner (session_id, dept, bound_at) "
+                "VALUES (?, ?, ?)", (session_id, owner, iso_utc(datetime.now(UTC))))
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT dept FROM session_owner WHERE session_id = ?",
+                (session_id,)).fetchone()
+        # 库为准同步内存视图（registry.bind_session 先到先得，同语义）
+        return self.registry.bind_session(session_id, str(row[0]) if row else owner)
+
+    def owner_of(self, session_id: str) -> str | None:
+        """会话属主（内存未命中落库查；均无返回 None）。"""
+        owner = self.registry.owner_of(session_id)
+        if owner is not None:
+            return owner
+        with self._sql_lock:
+            row = self._conn.execute(
+                "SELECT dept FROM session_owner WHERE session_id = ?",
+                (session_id,)).fetchone()
+        if row is None:
+            return None
+        return self.registry.bind_session(session_id, str(row[0]))
+
     def _load_session(self, session_id: str) -> SessionMapper:
         """注册表工厂：构造空 mapper 并从库中恢复该会话未过期映射行。"""
         cutoff = iso_utc(datetime.now(UTC) - self.ttl)
@@ -145,6 +193,15 @@ class SessionStore:
         with self._sql_lock:
             deleted = self._conn.execute(
                 "DELETE FROM masking_map WHERE first_seen < ?", (cutoff,)).rowcount
+            # 属主行随会话行同生命周期（bind_session docstring 同口径）：映射行
+            # 全数过期/删除、且绑定时间早于 TTL 截断后属主绑定一并清除（防
+            # session_owner 表随喷洒的随机 session id 无界增长，审查 §低危面）。
+            # ``bound_at < cutoff`` 下限保证刚绑定、尚未产生映射行的会话（干净
+            # 文本首次请求）不被本轮 cleanup 立即解除绑定（先到先得保持一个
+            # TTL 窗口）；映射行已过期的会话其 bound_at 必然更早，同轮清除。
+            self._conn.execute(
+                "DELETE FROM session_owner WHERE bound_at < ? AND session_id NOT IN "
+                "(SELECT DISTINCT session_id FROM masking_map)", (cutoff,))
             self._conn.commit()
         # 内存条目与落盘行同口径过期（活跃会话的旧条目也不能再还原）
         self.registry.apply(lambda m: m.purge_expired(cutoff_dt))
