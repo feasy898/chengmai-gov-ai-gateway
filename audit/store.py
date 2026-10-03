@@ -28,6 +28,11 @@ from audit.models import AuditEvent
 #: SQLite WAL 模式的旁挂文件后缀（bytes 级扫描必须一并覆盖：新写入先落 -wal）
 DB_SIDECAR_SUFFIXES: tuple[str, ...] = ("-wal", "-shm")
 
+#: 审计写队列死信文件后缀（audit.writer 落死信用）。死信内容虽为过闸脱敏预览，
+#: 但必须纳入全库 bytes 级扫描集——否则「单事件硬闸 + 全库扫描」双保险对死信
+#: 面不生效，未来死信格式变更即成扫描盲区（审查残余销项）。
+DEAD_LETTER_SUFFIX = ".dead_letter.jsonl"
+
 
 class RawPiiLeakError(ValueError):
     """零明文断言失败：审计面出现了本应被脱敏的原值。
@@ -107,14 +112,16 @@ def safe_preview(text: str, forbidden: Iterable[str], limit: int = PREVIEW_LIMIT
 
 
 def scan_db_files(db_path: str | Path) -> bytes:
-    """审计库主文件 + ``-wal``/``-shm`` 旁挂文件的原始字节拼接。
+    """审计库主文件 + ``-wal``/``-shm`` 旁挂文件 + 死信文件的原始字节拼接。
 
     WAL 模式下新提交的内容可能仍在 ``-wal`` 中尚未合入主文件——
-    漏扫旁挂文件会漏掉最新写入，故三者一并纳入扫描对象。
+    漏扫旁挂文件会漏掉最新写入；写库持续失败时整批事件落
+    :data:`DEAD_LETTER_SUFFIX` 死信文件——两者一并纳入扫描对象
+    （「单事件硬闸 + 全库文件扫描」双保险不得留落盘盲区）。
     """
     main = Path(db_path)
     parts: list[bytes] = []
-    for suffix in ("", *DB_SIDECAR_SUFFIXES):
+    for suffix in ("", *DB_SIDECAR_SUFFIXES, DEAD_LETTER_SUFFIX):
         f = Path(str(main) + suffix)
         if f.exists():
             parts.append(f.read_bytes())

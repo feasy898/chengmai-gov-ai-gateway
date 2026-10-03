@@ -6,7 +6,9 @@
   未入队即未落库，异常向网关调用方传播，app 层映射 500）；
 - 单写线程按 ``batch_size``/``flush_interval_s`` 批量 INSERT（单事务提交），
   ``PRAGMA journal_mode=WAL`` + ``synchronous=NORMAL``；队列饱和视为审计
-  完整性事故，抛错拒写而非静默丢弃；
+  完整性事故，抛错拒写而非静默丢弃；INSERT 持续失败同样不静默丢批——
+  回滚重试一次后仍失败即整批落死信文件（``<db>.dead_letter.jsonl``，
+  过闸脱敏事件可人工回灌，审查加固）；
 - 读取面（eval/e2e/后续 T5.1 查询 API 共用）：:meth:`count` /
   :meth:`fetch_all` / :meth:`journal_mode` / :meth:`checkpoint`，以及
   重开库直读的模块级 :func:`read_events` / :func:`count_events`；
@@ -27,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from audit.models import AuditEvent
-from audit.store import assert_no_raw_pii
+from audit.store import DEAD_LETTER_SUFFIX, assert_no_raw_pii
 from common.logs import get_logger
 from common.timeutil import iso_utc, parse_utc
 
@@ -172,9 +174,27 @@ class SqliteAuditWriter:
                 try:
                     self._insert(items)
                 except sqlite3.Error as exc:
+                    # 写失败不静默丢批（审查加固，与「饱和拒写不丢弃」同一红线）：
+                    # 先回滚重试一次（瞬时锁/IO 错误面），仍失败即整批落死信文件
+                    # （JSONL，事件均为过闸脱敏预览），事后可人工回灌，事件零丢失。
                     log.error("audit.writer.insert_failed", extra={
                         "batch": len(items), "exc_type": type(exc).__name__,
                     })
+                    try:
+                        with self._sql_lock:
+                            self._conn.rollback()
+                        time.sleep(0.05)
+                        self._insert(items)
+                    except sqlite3.Error as retry_exc:
+                        log.error("audit.writer.batch_dead_letter", extra={
+                            "batch": len(items), "exc_type": type(retry_exc).__name__,
+                        })
+                        try:
+                            self._dead_letter(items, type(retry_exc).__name__)
+                        except OSError as io_exc:
+                            log.critical("audit.writer.dead_letter_io_failed", extra={
+                                "batch": len(items), "exc_type": type(io_exc).__name__,
+                            })
                 finally:
                     for _ in items:
                         self._queue.task_done()
@@ -186,6 +206,22 @@ class SqliteAuditWriter:
         with self._sql_lock:
             self._conn.executemany(_INSERT_SQL, rows)
             self._conn.commit()
+
+    def _dead_letter(self, items: list[tuple[AuditEvent, list[str]]], exc_type: str) -> None:
+        """写库持续失败时整批事件落死信文件（JSONL 追加；审计链完整性兜底）。
+
+        内容 = 事件 JSON（预览为**过闸脱敏版本**，零明文红线不受影响；normalized
+        值列表不落盘，与库表口径一致）。事后经 ``json.loads`` 还原 AuditEvent
+        重放 append 即可回灌。文件名后缀与 :data:`audit.store.DEAD_LETTER_SUFFIX`
+        同源——该文件在全库 bytes 级零明文扫描集内（audit.store.scan_db_files）。
+        """
+        path = Path(str(self.db_path) + DEAD_LETTER_SUFFIX)
+        line = json.dumps({
+            "dead_letter": True, "error": exc_type, "batch": len(items),
+            "events": [event.model_dump(mode="json") for event, _ in items],
+        }, ensure_ascii=False)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
 
     # ── 排干/观测/生命周期 ───────────────────────────────────────
     def flush(self, timeout_s: float = 5.0) -> bool:
