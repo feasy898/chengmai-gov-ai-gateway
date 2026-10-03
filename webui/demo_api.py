@@ -13,8 +13,10 @@
 演示态 ON = seed（注入全合成事件，看板指标随之呈现三部门分布）；演示态 OFF =
 clear（摘掉的只是合成事件，真实流量事件不受影响）。
 
-鉴权（与 /admin/api/audit 同一硬口径，T5.1）：任意一个有效部门 Key
+鉴权（与 /admin/api/audit 同一硬口径，T5.1）：缺省任意一个有效部门 Key
 （``Authorization: Bearer <dept_key>``）放行；缺 key / 错 key → 401。
+配置 admin key（env 名 ``cfg.admin_key_env``，缺省 ``ANONGW_ADMIN_KEY``）后
+只认该 key（seed/clear 属管理面写动作，审查加固：部门 Key 不再放行）。
 生产部署另须仅经本地管理面/内网访问（与 /internal/* 同一安全注记）。
 
 安全与数据口径：
@@ -27,6 +29,8 @@ clear（摘掉的只是合成事件，真实流量事件不受影响）。
   一律绑定）。
 """
 from __future__ import annotations
+
+import hmac
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -47,11 +51,14 @@ def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
 
 
 def _authenticate(app: FastAPI, request: Request) -> str | None:
-    """部门 Key 鉴权（常量时间比较，与 /admin/api/audit 同一实现）；未命中 None。"""
-    return deps.authenticate(
-        deps.extract_bearer(request.headers.get("authorization")),
-        app.state.dept_key_digests,
-    )
+    """演示态管理面鉴权：配置了 admin key 时只认它；否则回落部门 Key（常量时间比较）。"""
+    presented = deps.extract_bearer(request.headers.get("authorization"))
+    admin_digest = getattr(app.state, "admin_key_digest", None)
+    if admin_digest:
+        if presented and hmac.compare_digest(deps.sha256_hex(presented), admin_digest):
+            return "__admin__"
+        return None
+    return deps.authenticate(presented, app.state.dept_key_digests)
 
 
 def mount(app: FastAPI) -> None:
