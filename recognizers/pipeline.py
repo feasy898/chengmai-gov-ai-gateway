@@ -16,8 +16,14 @@ from recognizers.semantic.adapter import get_semantic_adapter
 
 
 def detect_full(text: str) -> list[Finding]:
-    """规则层 + 语义层合并结果（span 升序）；fid 恒空串，由调用方按请求编号。"""
+    """规则层 + 语义层合并结果（span 升序）；fid 恒空串，由调用方按请求编号。
+
+    规则层 findings 同时传给语义层作 **judge 脱敏依据**（审查加固）：LLM-judge
+    端点可能为外部服务，未脱敏原文（PII/密级词表面形式）不得在 BLOCK/脱敏判定
+    之前出网——judge 补判收到的文本已把规则层命中面替换为中性占位；词表判定
+    仍在原文上进行，span 定位不受影响。
+    """
     findings = detect(text)
-    findings.extend(get_semantic_adapter().detect(text))
+    findings.extend(get_semantic_adapter().detect(text, rule_findings=findings))
     findings.sort(key=lambda f: (f.start, f.end, f.type.value))
     return findings

@@ -13,6 +13,9 @@
   judge 仅在词表零命中时补判一次（词表已命中无需再问），judge 故障按词表
   结果降级、不抛错。judge 补判命中产出**无 span** 的整段 finding（``raw=""``，
   语义判定无字符级定位，raw 留空即不进表面形式清单/审计预览替换面）。
+  judge 端点可能为外部服务：补判收到的文本先按规则层命中把 PII/密级表面
+  形式替换为中性占位（审查加固：原文不在脱敏/BLOCK 判定前出网，见
+  :meth:`SemanticAdapter._redact_for_judge`）。
 - **接口形状不变**（P0 冻结）：``moderate(text) -> {verdict, categories}``，
   verdict ∈ {"safe", "flagged"}；``config.app.moderation_model`` 指向的本地
   guard 模型属后续任务，本层 MVP 不加载任何本地模型（传入 model_path 仅记录
@@ -24,6 +27,7 @@ INJECTION_EXFIL（工具诱导外发/内容走私）、INJECTION_EMBEDDED（位�
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from common.logs import get_logger
@@ -72,29 +76,36 @@ class SemanticAdapter:
         self._judge = judge if judge is not None else LlmJudge.from_env()
 
     # ── 契约入口（P0 冻结形状）────────────────────────────────────
-    def moderate(self, text: str) -> dict[str, Any]:
+    def moderate(self, text: str, *, rule_findings: Sequence[Finding] = ()) -> dict[str, Any]:
         """语义审核：``{"verdict": "safe"|"flagged", "categories": [str]}``。
 
         词表命中即 flagged；词表零命中且 judge 已配置时补判一次（judge 故障
-        降级为词表结果）。categories 见模块 docstring 值域。
+        降级为词表结果）。``rule_findings`` 为调用方已有的规则层命中——judge
+        端点可能为外部服务，补判前把其中 PII/密级词表面形式替换为中性占位
+        （审查加固：原文不在脱敏/BLOCK 判定前出网到 judge）。categories 见
+        模块 docstring 值域。
         """
         findings, categories = self._scan(text)
         if not findings:
-            judge_verdict, judge_categories = self._judge_lookup(text)
+            judge_verdict, judge_categories = self._judge_lookup(
+                self._redact_for_judge(text, rule_findings))
             if judge_verdict == "flagged":
                 return {"verdict": "flagged",
                         "categories": sorted(set(judge_categories) | {CATEGORY_JUDGE})}
         return {"verdict": "flagged" if findings else "safe", "categories": categories}
 
     # ── finding 级视图（网关主链路消费；fid 恒空串由调用方编号）────
-    def detect(self, text: str) -> list[Finding]:
+    def detect(self, text: str, *,
+               rule_findings: Sequence[Finding] = ()) -> list[Finding]:
         """注入检测：返回 INJECTION Finding 列表（start 升序、span 去重）。
 
         词表命中带精确 span；judge 补判命中为整段无 surface finding（raw=""）。
+        ``rule_findings``：规则层命中（judge 补判前据此脱敏，见 :meth:`moderate`）。
         """
         findings, _ = self._scan(text)
         if not findings:
-            judge_verdict, _ = self._judge_lookup(text)
+            judge_verdict, _ = self._judge_lookup(
+                self._redact_for_judge(text, rule_findings))
             if judge_verdict == "flagged" and text:
                 findings.append(Finding(
                     fid="", type=EntityClass.INJECTION, layer="semantic",
@@ -146,6 +157,26 @@ class SemanticAdapter:
         return str(verdict.get("verdict", "safe")), [
             str(c) for c in verdict.get("categories", []) if isinstance(c, str)
         ]
+
+    @staticmethod
+    def _redact_for_judge(text: str, rule_findings: Sequence[Finding]) -> str:
+        """judge 补判前的脱敏（审查加固）：规则层 PII/密级表面形式 → 中性占位。
+
+        judge 端点（``SEMANTIC_JUDGE_BASE_URL``）可能为外部服务：未脱敏原文
+        在路由 BLOCK / 会话脱敏**之前**发往 judge 即构成原文外发面（含最终被
+        403 拦截的密级文本）。此处把非白名单的 MASK/BLOCK_FLAG 命中面按 span
+        倒序替换为 ``〔脱敏〕``——注入指令文本不受影响（judge 只判注入语义）；
+        词表判定仍在原文上进行，位置语义不变。
+        """
+        spans = [(f.start, f.end) for f in rule_findings
+                 if not f.whitelisted and f.action_hint in ("MASK", "BLOCK_FLAG")
+                 and f.end > f.start]
+        if not spans:
+            return text
+        out = text
+        for start, end in sorted(spans, reverse=True):
+            out = out[:start] + "〔脱敏〕" + out[end:]
+        return out
 
     @staticmethod
     def _dedupe(findings: list[Finding]) -> list[Finding]:
