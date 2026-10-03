@@ -44,3 +44,6 @@ out/
 
 # 安全门禁（mimosa）hook 运行态/缓存：本地工件，不进仓库
 .mimosa/
+
+# 门禁运行留档（eval 原始日志逐字引用，本地工件不进仓库；name_lint/export 同口径排除）
+evidence/

@@ -5,6 +5,9 @@
 2. 环境变量覆盖：对顶层键 K，若存在环境变量 ``ANONGW_<K 大写>``（如
    ``ANONGW_LISTEN``、``ANONGW_SESSION_TTL_H``），其值覆盖 yaml；
    值按 JSON 解析（int/bool/list 生效），解析失败则按原样字符串。
+   豁免：密钥「环境变量名」字段（``mask_key_env`` / ``admin_key_env``）不在
+   覆盖面内——其值本身是环境变量名，可被同前缀变量改指即构成 fail-open
+   （审查加固，见 :data:`_SECRET_ENV_FIELDS`）。
 3. 密钥不写进任何配置文件：yaml 只存环境变量 *名*（``mask_key_env``、
    ``api_key_env``），运行时经 :func:`resolve_secret` 解析。
 4. ``.env`` 文件可用 :func:`load_env_file` 预载（默认不覆盖已有环境变量）。
@@ -29,7 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 class UpstreamCfg(BaseModel):
     """单条上游定义（字段即契约，只增不改名）。"""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     base_url: str
@@ -41,15 +44,19 @@ class UpstreamCfg(BaseModel):
 class ThresholdsCfg(BaseModel):
     """路由/识别阈值（字段即契约，只增不改名）。"""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     batch_pii_to_govcloud: int = 3
 
 
 class AppConfig(BaseModel):
-    """主配置模型（字段即契约，只增不改名）。"""
+    """主配置模型（字段即契约，只增不改名）。
 
-    model_config = ConfigDict(extra="allow")
+    ``extra="forbid"``（审查加固，契约模型同口径）：写错/拼错的配置键不再被
+    静默吞掉——加载即报错，防「配置改了不生效」的假绿灯。
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     listen: int = 9000
     mask_key_env: str = "MASK_KEY"
@@ -57,6 +64,12 @@ class AppConfig(BaseModel):
     upstreams: list[UpstreamCfg] = Field(default_factory=list)
     ai_label: str = "本内容由AI生成"
     thresholds: ThresholdsCfg = Field(default_factory=ThresholdsCfg)
+    # 语义审核模型（D4 接入）：HF/魔搭路径只允许写在这里（中性名纪律，审查 §E）；
+    # 留空 = 未配置（outguard P0 NullModerator，不加载任何本地模型）
+    moderation_model: str = ""
+    # 管理面 admin key 的环境变量名（审查加固旋钮；只存变量名不存值——
+    # 值经 resolve_secret 运行时解析，配置了即 /admin/api/* 只认该 key）
+    admin_key_env: str = "ANONGW_ADMIN_KEY"
     # 库文件（T1.3，相对路径按仓库根解析）：审计库与会话映射库**必须分文件**——
     # 审计库要过 bytes 级全文件零明文扫描（§9 U5），而 masking_map 必须存归一化
     # 原值才能还原（见 masking/session_store.py 模块文档）
@@ -70,8 +83,18 @@ class AppConfig(BaseModel):
     pdf_engine_module: str = ""
 
 
+#: 环境覆盖豁免面（审查加固）：「环境变量名」类字段不参与 ``ANONGW_<K>`` 覆盖。
+#: 这些字段的值本身是环境变量名（缺省 ``ANONGW_ADMIN_KEY`` / ``MASK_KEY``），若
+#: 可被 ``ANONGW_ADMIN_KEY_ENV`` 等同前缀变量在运行期改指到任意变量（攻击者
+#: 可控或空值），管理面硬闸/掩码密钥即被静默改挂——fail-open。密钥一律只经
+#: yaml/env 原值注入，不设第二道覆盖旋钮。
+_SECRET_ENV_FIELDS = frozenset({"admin_key_env", "mask_key_env"})
+
+
 def _override_from_env(data: dict[str, Any], env: Mapping[str, str]) -> dict[str, Any]:
     for key in list(data.keys()):
+        if str(key) in _SECRET_ENV_FIELDS:
+            continue  # 豁免面：密钥变量名不被 ANONGW_<K> 覆盖（见上注释）
         env_name = ENV_PREFIX + str(key).upper()
         if env_name in env:
             raw = env[env_name]

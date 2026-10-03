@@ -26,8 +26,10 @@ python -m venv .venv
 
 # 2) 配置
 cp .env.example .env                           # 至少填写 MASK_KEY（32 字节 hex）
-#   演示部门 key（config/dept_keys.yaml 只存 sha256，明文仅演示用）：
-#   县政府办 dk_1a2b3c4d / 民政局 dk_5e6f7a8b / 某镇 dk_9c0d1e2f
+#   演示部门 key：明文写在部署交付物 .env.example 的注释里，也以常量形式存在于
+#   仓内 evals/ops 离线自测与演示脚本中（本地模式/CI 需要它通过本地鉴权）；
+#   config/dept_keys.yaml 只存其 sha256，页面不渲染任何 key 明文——
+#   生产部署必须更换哈希（安全注记见 §6）
 
 # 3) 起两路 mock 上游（:8901 互联网 / :8902 政务云；Windows 下用两个终端分别执行）
 ./.venv/Scripts/python -m gateway.mock_upstream --host 127.0.0.1 --port 8901
@@ -46,8 +48,9 @@ cp .env.example .env                           # 至少填写 MASK_KEY（32 字�
 体验（含身份证/手机的请求 → 上游只见占位符 → 客户端拿到还原答案）：
 
 ```bash
+DEPT_KEY=<本部门演示 key，见 .env.example 注释>
 curl http://127.0.0.1:9000/v1/chat/completions \
-  -H "Authorization: Bearer dk_1a2b3c4d" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $DEPT_KEY" -H "Content-Type: application/json" \
   -d '{"model":"mock-chat","messages":[{"role":"user","content":"干部张三，身份证460022199003071234，电话13800138000，帮我看下低保材料"}]}'
 ```
 
@@ -109,5 +112,18 @@ docker compose up       # 起 mock-internet(:8901) / mock-govcloud(:8902) / gate
 - `/v1/chat/completions` 与 `/internal/*` 均需部门 Key（`Authorization: Bearer dk_***`）；
   `/internal/*` 响应含识别明细与还原原文，只应经本机管理面（127.0.0.1）或
   受控内网访问，**不得暴露公网**。
+- 会话与部门绑定：会话首次使用即归属到该部门，其他部门 Key 复用该
+  `session_id`（含 `/internal/restore` 还原）一律 403——占位符映射无法被
+  跨部门反查还原。
+- 管理面硬闸（可选）：设置环境变量 `ANONGW_ADMIN_KEY`（变量名可经
+  `config/app.yaml admin_key_env` 调整）后，`/admin/api/*` 只认该管理 key，
+  部门 Key 不再放行审计查询/看板演示态切换；`/webui/dashboard` 仅对本机
+  回环请求渲染。生产部署请启用 admin key 并保持管理面仅经内网/反代可达。
+- 演示部门 key 属**本地演示**凭据：明文写在部署交付物 `.env.example` 的注释里
+  （供本地模式快速体验），也以常量形式存在于仓内 `evals/`、`ops/` 离线自测与
+  演示脚本中（均为公开演示凭据；服务端只存 sha256，页面不渲染任何 key 明文）；
+  生产部署必须更换 `config/dept_keys.yaml` 中的哈希（换真 key）。
 - 审计库只存脱敏内容：入库前硬闸断言 + 全库文件 bytes 级扫描双保险；
-  密钥只经环境变量 / `.env` 注入，不入任何配置文件与代码。
+  真值密钥（`MASK_KEY`、上游 key、admin key、judge key）只经环境变量 / `.env`
+  注入，不入任何配置文件与代码；演示部门 key 为**测试夹具明文**（见上条：
+  `.env.example` 注释与仓内 `evals/`、`ops/` 脚本常量），生产部署必须更换。
