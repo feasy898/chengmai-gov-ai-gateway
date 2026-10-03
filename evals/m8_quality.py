@@ -82,8 +82,10 @@ AI_LABEL = "本内容由AI生成"       # config/app.yaml ai_label
 REAL_PROFILE_INTERNET = "internet_real"
 REAL_PROFILE_GOVCLOUD = "govcloud_real"
 
-ANSWER_MAX_TOKENS = 128          # 答案生成长度上限（答案要求简短）
-JUDGE_MAX_TOKENS = 96            # 评分 JSON 长度上限
+ANSWER_MAX_TOKENS = 1024         # 答案生成长度上限（答案要求简短；2026-10-03 128→1024：
+                                 # 真实上游换思考型云端模型，思考段先行耗尽小预算致正文
+                                 # 为空——只放宽请求预算，空回复断言与评分口径不变）
+JUDGE_MAX_TOKENS = 512           # 评分 JSON 长度上限（2026-10-03 96→512，同上因）
 HEALTH_TIMEOUT_S = 5.0
 CALL_TIMEOUT_S = 240.0           # 单次真实推理客户端总超时
 HTTP_RETRIES = 2                 # 瞬时故障（隧道抖动/5xx）重试次数
@@ -203,21 +205,50 @@ def _service_ready(ctx: dict[str, Any]) -> tuple[bool, str]:
 
 # ── 请求原语（显式字面量主机 + 瞬时故障重试）────────────────────────────────
 
+def _is_content_filter_1301(status_code: int, body_text: str) -> bool:
+    """上游内容安全闸签名：HTTP 400 且 body 含 code 1301 / contentFilter 字样。
+
+    1301 = bigmodel 云端风控对**外部输入**的偶发误伤——占位符化后的合成夹具
+    （masked 腿）与原文夹具（orig/judge 腿）都可能触发，也会误伤模型自身草稿；
+    纯云端服务非确定性，与网关链路无关。有界重试（重发同一请求=换一个采样）是
+    外部服务非确定性韧性，不是掩盖网关缺陷；产品侧 gateway/provider 透传行为不改。
+    """
+    return status_code == 400 and "contentFilter" in body_text and "1301" in body_text
+
+
 def _post_chat(client: httpx.Client, url: str, payload: dict[str, Any],
                headers: dict[str, str], *, what: str) -> httpx.Response:
     last = ""
-    for attempt in range(HTTP_RETRIES + 1):
+    http_retries = 0   # 瞬时故障（隧道抖动/5xx）已用重试次数
+    cf_retries = 0     # 上游 1301 风控误伤已用重试次数（独立有界，间隔递增）
+    while True:
         try:
             resp = client.post(url, json=payload, headers=headers)
             if resp.status_code == 200:
                 return resp
-            last = f"status={resp.status_code} body={resp.text[:160]!r}"
+            body_text = resp.text
+            last = f"status={resp.status_code} body={body_text[:160]!r}"
+            if _is_content_filter_1301(resp.status_code, body_text):
+                if cf_retries < th.M8_CONTENT_FILTER_RETRIES:
+                    cf_retries += 1
+                    delay = 2.0 * cf_retries        # 间隔递增（2s→4s）
+                    print(f"[m8_quality] {what}: 上游内容安全闸 400(code=1301)，"
+                          f"{delay:.0f}s 后重试 {cf_retries}/{th.M8_CONTENT_FILTER_RETRIES}",
+                          flush=True)
+                    time.sleep(delay)
+                    continue
+                last = (f"上游内容过滤（code=1301，重试 "
+                        f"{th.M8_CONTENT_FILTER_RETRIES} 次仍命中）：{last}")
+                break  # 全部尝试均 1301 → 如实 FAIL（注明上游内容过滤）
             if resp.status_code < 500:
                 break  # 4xx（拦截/参数）：非瞬时，如实失败
         except httpx.TransportError as exc:
             last = f"{type(exc).__name__}: {exc}"
-        if attempt < HTTP_RETRIES:
-            time.sleep(2.0 * (attempt + 1))
+        if http_retries < HTTP_RETRIES:
+            http_retries += 1
+            time.sleep(2.0 * http_retries)
+            continue
+        break
     raise AssertionError(f"{what}: {last}")
 
 
@@ -307,14 +338,18 @@ def phase_masked(ctx: dict[str, Any]) -> str:
         httpx.post(f"{ctx['root']}/admin/reset", timeout=5.0)
         client = httpx.Client(base_url=f"{GATEWAY_BASE}:{GATEWAY_PORT}",
                               timeout=httpx.Timeout(CALL_TIMEOUT_S))
-        auth = {"Authorization": f"Bearer {DEMO_KEY}", "x-anongw-session-id": SESSION_ID}
+        auth = {"Authorization": f"Bearer {DEMO_KEY}"}
         out: list[dict[str, Any]] = []
         for p in pairs:
+            # 每 QA 独立会话 ID（本测试可控维度，形状符合网关 SESSION_ID_RE）：
+            # 审计计数按会话归属到 QA，上游 1301 风控误伤重发多写的
+            # upstream_status_400 透传行不会击穿完成态计数
+            session = f"{SESSION_ID}_{p.qid}"
             t0 = time.perf_counter()
             resp = _post_chat(client, "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": _user_prompt(p)}],
                 "temperature": 0, "max_tokens": ANSWER_MAX_TOKENS,
-            }, auth, what=f"{p.qid}/masked")
+            }, {**auth, "x-anongw-session-id": session}, what=f"{p.qid}/masked")
             latency_ms = int((time.perf_counter() - t0) * 1000)
             route = resp.headers.get("x-anongw-route")
             assert route == p.expect_route, f"{p.qid}/masked: route {route} != {p.expect_route}"
@@ -337,19 +372,41 @@ def phase_masked(ctx: dict[str, Any]) -> str:
                  if val.encode("utf-8") in blob]
         assert not leaks, f"上游 ring 出现 seeded 原值（脱敏缺位）: {leaks[:5]}"
 
-        # 审计：n 行如落库（临时库，不碰 data/audit.db）
+        # 审计：按本测试可控维度（每 QA 独立会话 ID 前缀过滤）断言——每个 QA
+        # 恰有一条「完成态」事件（flags 空 + response_preview 非空），完成态
+        # 总数 == n；不再用全表行数口径。原因：上游 1301 风控误伤的有界重试会
+        # 多写一条 upstream_status_400 透传行（pipeline 对上游非 200 如实落账，
+        # 透传行为不改）——那是外部服务非确定性的如实审计记录，不是网关缺陷，
+        # 完成态计数不受其影响。（临时库，不碰 data/audit.db）
         audit: SqliteAuditWriter = ctx["audit_gw"]
         deadline = time.monotonic() + 10.0
         while len(audit) < n and time.monotonic() < deadline:
             time.sleep(0.1)
-        assert audit.flush(timeout_s=5.0) and len(audit) == n, \
-            f"审计行数 {len(audit)} != {n}"
+        assert audit.flush(timeout_s=5.0)
+        rows = audit.fetch_all()
+
+        def _is_done(ev: Any) -> bool:
+            # 完成态 = 走完全链路的成功事件（pipeline 成功分支 flags 恒空、
+            # response_preview 非空）；1301 透传行 flags=["upstream_status_400"]、
+            # 预览为空，天然不计入
+            return not ev.flags and bool(ev.response_preview)
+
+        done_by_session: dict[str, int] = {}
+        for _row_id, ev in rows:
+            if ev.session_id.startswith(SESSION_ID) and _is_done(ev):
+                done_by_session[ev.session_id] = done_by_session.get(ev.session_id, 0) + 1
+        for p in pairs:
+            got = done_by_session.get(f"{SESSION_ID}_{p.qid}", 0)
+            assert got == 1, f"{p.qid}: 完成态审计事件 {got} != 1"
+        total_done = sum(done_by_session.values())
+        assert total_done == n, f"审计完成态事件总数 {total_done} != {n}"
 
         routes = Counter(r["route"] for r in out)
         lat = sorted(r["latency_ms"] for r in out)
         return (f"{n} 腿经网关真实链路（路由 {dict(sorted(routes.items()))}，"
                 f"客户端零占位符/零泄漏）；上游 ring {records.get('count')} 条全文 "
-                f"{len(blob)} 字节零 seeded 原值；审计 {len(audit)} 行；"
+                f"{len(blob)} 字节零 seeded 原值；审计 {len(rows)} 行"
+                f"（完成态 {total_done} == {n}）；"
                 f"延迟 mean={sum(lat) // len(lat)}ms p95={lat[int(0.95 * (len(lat) - 1))]}ms")
     finally:
         if client is not None:

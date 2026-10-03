@@ -54,6 +54,7 @@ SSE 检查额外起进程内 mock 上游与临时端口）。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import io
 import json
@@ -306,7 +307,9 @@ def check_webui_material_text(app: Any) -> str:
     return "白名单外 404；注入版 docx text 含埋注段且与生成器构造面逐字一致"
 
 
-#: 聊天页探针（T5.2 双屏对比页）：双栏 + 两 API 端点 + route 头 + SSE 客户端标记
+#: 聊天页探针（T5.2 双屏对比页）：双栏 + 两 API 端点 + route 头 + SSE 客户端标记。
+#: 审查加固后页面不再渲染演示 Key 明文（dk_* 不入页面/源码）——「部门 Key 选择器」
+#: 探针改为部门名选择 + 密钥输入框（同一覆盖意图：携带部门 Key 的交互面在位）。
 _CHAT_PROBES: tuple[str, ...] = (
     "上游实际收到",                 # 右栏标题（§10 场景1）
     "/v1/chat/completions",
@@ -316,7 +319,8 @@ _CHAT_PROBES: tuple[str, ...] = (
     "text/event-stream",            # SSE 流式客户端标记
     "[DONE]",
     "x-anongw-session-id",          # 会话续接（多轮稳定脱敏）
-    "dk_5e6f7a8b",                  # 演示部门 Key 选择器（民政局）
+    "民政局",                       # 演示部门选择器（部门名渲染）
+    'id="dept-key-input"',          # 部门 Key 密钥输入框（Key 明文不进页面）
 )
 
 
@@ -468,6 +472,63 @@ def check_webui_dashboard_render(app: Any, store: InMemoryAuditStore) -> str:
 def check_webui_dashboard_initial(app: Any) -> str:
     _dashboard_empty_probes(app)
     return "空库零态：200 + 三指标卡 + 三 SVG 容器 + 明细空态提示"
+
+
+def check_webui_dashboard_loopback_only(app: Any) -> str:
+    """看板回环闸（审查加固回归钉）：非回环 client → 403 错误信封；回环 → 200。"""
+    async def run() -> str:
+        async with httpx.AsyncClient(
+                transport=ASGITransport(app=app, client=("192.0.2.111", 1234)),
+                base_url="http://anongw.test") as client:
+            resp = await client.get("/webui/dashboard")
+        if resp.status_code != 403 or resp.json()["error"]["code"] != "unauthorized":
+            raise AssertionError(f"remote dashboard: {resp.status_code} {resp.text[:160]!r}")
+        if "仅限本机访问" not in resp.json()["error"]["message"]:
+            raise AssertionError(f"message: {resp.json()['error']['message']!r}")
+        return "remote client (192.0.2.111) -> 403 unauthorized"
+    remote = asyncio.run(run())
+    loop = _get(app, "/webui/dashboard")   # 回环口径（ASGI 默认 client=127.0.0.1）
+    if loop.status_code != 200:
+        raise AssertionError(f"loopback dashboard: {loop.status_code}")
+    return f"{remote}; loopback -> 200"
+
+
+def check_admin_key_hard_gate() -> str:
+    """admin key 硬闸（审查加固回归钉）：配置后 /admin/api/*（含演示态端点）只认
+    admin key，部门 Key 不再放行；未配置回落部门 Key。"""
+    dept_key_plain = "dk_m9_admin_gate_case"
+    digests = {"民政局": hashlib.sha256(dept_key_plain.encode()).hexdigest()}
+    cfg = load_app_config()
+    audit = InMemoryAuditStore()
+    env_name = "ANONGW_ADMIN_KEY"
+    old_value = os.environ.get(env_name)
+    os.environ[env_name] = "m9-admin-secret-0001"
+    try:
+        app_locked = create_app(cfg=cfg, mask_key=MASK_KEY,
+                                dept_key_digests=digests, audit_store=audit)
+    finally:
+        if old_value is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = old_value
+
+    async def run() -> str:
+        dept_h = {"Authorization": f"Bearer {dept_key_plain}"}
+        admin_h = {"Authorization": "Bearer m9-admin-secret-0001"}
+        async with httpx.AsyncClient(transport=ASGITransport(app=app_locked),
+                                     base_url="http://anongw.test") as client:
+            r_audit = await client.get("/admin/api/audit", headers=dept_h)
+            if r_audit.status_code != 401:
+                raise AssertionError(f"dept key on /admin/api/audit: {r_audit.status_code}")
+            r_demo = await client.get("/admin/api/demo/state", headers=dept_h)
+            if r_demo.status_code != 401:
+                raise AssertionError(f"dept key on /admin/api/demo/state: {r_demo.status_code}")
+            r_admin = await client.get("/admin/api/audit", headers=admin_h)
+            if r_admin.status_code != 200:
+                raise AssertionError(f"admin key rejected: {r_admin.status_code} {r_admin.text[:160]!r}")
+        return ("admin key gate: dept key 401 on audit + demo/state; admin key 200 "
+                "(env var restored after app build)")
+    return asyncio.run(run())
 
 
 DEMO_KEY_T52 = "dk_5e6f7a8b"          # 民政局（.env.example 演示明文，哈希在 config/dept_keys.yaml）
@@ -704,6 +765,8 @@ def main() -> int:
     _record("场景材料 text 端点（载入聊天）", lambda: check_webui_material_text(app))
     _record("聊天页双屏（/webui/chat，T5.2）", lambda: check_webui_chat_page(app))
     _record("看板空库零态（/webui/dashboard）", lambda: check_webui_dashboard_initial(app))
+    _record("看板回环闸（非回环 403 / 回环 200）", lambda: check_webui_dashboard_loopback_only(app))
+    _record("管理面 admin key 硬闸（部门 Key 401 / admin 200）", lambda: check_admin_key_hard_gate())
     _record("inspect docx（FileReport 契约）", lambda: check_inspect_docx(app))
     _record("export docx（X-Report-Id + 零残留）", lambda: check_export_docx(app))
     _record("xlsx 隐藏列体检+删列导出", lambda: check_xlsx_hidden_col(app))

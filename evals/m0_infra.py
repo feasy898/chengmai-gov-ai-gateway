@@ -183,7 +183,33 @@ def check_env_override() -> str:
             os.environ.pop(key, None)
         else:
             os.environ[key] = old
-    return "ANONGW_* overrides apply (int + str), no cross-contamination"
+
+    # 负例（审查加固）：密钥「环境变量名」字段（admin_key_env / mask_key_env）
+    # 不参与 ANONGW_<K> 覆盖——admin_key_env 缺省值 ANONGW_ADMIN_KEY 与覆盖机制
+    # 同命名空间，若可被 ANONGW_ADMIN_KEY_ENV 改指任意变量，管理面硬闸/掩码
+    # 密钥会在运行期被静默改挂（fail-open）。临时 yaml 显式带这两个键，
+    # 注入同名覆盖变量后加载，两字段必须原样保留。
+    probe_dir = REPO_ROOT / "data"
+    probe_dir.mkdir(exist_ok=True)
+    # 文件名带 pid：并发复跑多实例时不共享同一临时 yaml（防 A 实例 finally unlink
+    # 与 B 实例 load_app_config 竞态——固定名是间歇性失败的火种）
+    probe = probe_dir / f"m0_secret_env_probe_{os.getpid()}.yaml"
+    probe.write_text(
+        "listen: 9000\nmask_key_env: MASK_KEY\nadmin_key_env: ANONGW_ADMIN_KEY\n",
+        encoding="utf-8")
+    try:
+        poisoned = load_app_config(probe, env={"ANONGW_ADMIN_KEY_ENV": "ATTACKER_VAR",
+                                               "ANONGW_MASK_KEY_ENV": "ATTACKER_VAR"})
+        assert poisoned.admin_key_env == "ANONGW_ADMIN_KEY", \
+            f"admin_key_env must not be env-overridable, got {poisoned.admin_key_env!r}"
+        assert poisoned.mask_key_env == "MASK_KEY", \
+            f"mask_key_env must not be env-overridable, got {poisoned.mask_key_env!r}"
+        normal = load_app_config(env={"ANONGW_ADMIN_KEY_ENV": "ATTACKER_VAR"})
+        assert normal.admin_key_env == "ANONGW_ADMIN_KEY"
+    finally:
+        probe.unlink(missing_ok=True)
+    return ("ANONGW_* overrides apply (int + str); secret env-name fields "
+            "(admin_key_env/mask_key_env) NOT overridable")
 
 
 def check_secrets() -> str:
@@ -444,7 +470,9 @@ def check_contract_extra_forbid() -> str:
     往 §5 示例 JSON 里塞一个多余字段再 ``model_validate``，必须抛校验错误——
     防止未来有人删掉 ``extra="forbid"`` 而往返用例仍然全绿（假绿灯盲区）。
     覆盖全部 9 个契约模型类（含嵌套的 RouteReason / FileFinding / 嵌套 Finding /
-    ErrorBody）。
+    ErrorBody）+ 同口径 ``extra="forbid"`` 的 3 个配置模型
+    （AppConfig / UpstreamCfg / ThresholdsCfg——审查残余销项：拼错的配置键
+    必须加载即报错而非静默吞掉）。
     """
     rm = importlib.import_module("recognizers.models")
     rt = importlib.import_module("routing.models")
@@ -452,6 +480,7 @@ def check_contract_extra_forbid() -> str:
     am = importlib.import_module("audit.models")
     fm = importlib.import_module("filechannel.models")
     gm = importlib.import_module("gateway.models")
+    cm = importlib.import_module("common.config")
     probe = "__extra_probe__"
 
     def reject(model_cls, data: dict, where: str) -> None:
@@ -472,8 +501,13 @@ def check_contract_extra_forbid() -> str:
     err = json.loads(API_ERROR_JSON)
     reject(gm.ApiError, err, "ApiError")
     reject(gm.ErrorBody, err["error"], "ErrorBody")
-    return ("extra-field rejected on 9 contract models: Finding/RouteDecision/RouteReason/"
-            "MappingEntry/AuditEvent/FileReport/FileFinding/ErrorBody/ApiError")
+    reject(cm.UpstreamCfg, {"name": "u", "base_url": "http://127.0.0.1:1/v1",
+                            "api_key_env": "K"}, "UpstreamCfg")
+    reject(cm.ThresholdsCfg, {"batch_pii_to_govcloud": 3}, "ThresholdsCfg")
+    reject(cm.AppConfig, {"listen": 9000}, "AppConfig")
+    return ("extra-field rejected on 9 contract + 3 config models: Finding/RouteDecision/"
+            "RouteReason/MappingEntry/AuditEvent/FileReport/FileFinding/ErrorBody/ApiError/"
+            "AppConfig/UpstreamCfg/ThresholdsCfg")
 
 
 CONTRACT_CHECKS = (

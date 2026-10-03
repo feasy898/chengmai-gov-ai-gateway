@@ -18,9 +18,11 @@ exit 0 = 通过。检查项（对应任务单 T0.5 完成定义：对 mock 上�
    放行；完整括号对但查表未命中 → 原样放行；流末 flush 残留候选；
    **T8.4 改形形态目录**：模型对占位符 token 的已知改形（反引号包裹/内嵌、
    空白与换行插入拆开、hex 大小写/全半角转写、易混字符 O→0/l→1、同形括号
-   〔→【[ 与间隔号 ·→・•. 转写、组合改形）整段与流式逐块还原全等——
+   〔→【[ 与间隔号 ·→・•. 转写、括号外前缀文案并入括号内且多出冒号段
+   （「主号：〔手机号·…〕」→「〔主号：手机号·…〕」，U8 INTERNET 腿实锤，
+   只认已知标签集）、组合改形）整段与流式逐块还原全等——
    构造样本直测，不依赖模型随机性；负例（非占位符的同形括号文本/markdown
-   链接/未知占位符）原样放行零误替；
+   链接/未知占位符/前缀段剥不出已知标签或映射表外的改形）原样放行零误替；
 5. SSE 字节层：任意字节切块（含把多字节 UTF-8 切成两半）→ 半行缓冲解析
    逐事件全等；经 compose_chat_stream 全管线输出与整段处理全等；
 6. 密级样例 stream=true → 403 content_blocked（普通 JSON，非 SSE），上游零感知；
@@ -30,7 +32,11 @@ exit 0 = 通过。检查项（对应任务单 T0.5 完成定义：对 mock 上�
 9. 干净文本流式：占位符零涉及，还原 = 原文，AI 标识仍在；
 10. 审计：每个已处理流式请求一条事件；response_preview 为**还原前占位符版本**；
     全部 preview bytes 级零原值；
-11. 上游不可达 + stream=true → 502 upstream_error 信封（开流前决出，非 SSE）。
+11. 上游不可达 + stream=true → 502 upstream_error 信封（开流前决出，非 SSE）；
+12. 流式输出复检（审查加固回归钉）：flagged 后端 → 200 SSE 照常放行（留痕
+    语义），审计 flag=output_flagged；redact 脱敏承接输出占位符版本；
+13. 收尾 flush 残片（未闭合占位符候选）同口径进 on_content 与 on_restored
+    （审计预览与输出侧复检不漏尾片）。
 """
 from __future__ import annotations
 
@@ -56,6 +62,7 @@ from httpx import ASGITransport  # noqa: E402
 
 from audit.store import InMemoryAuditStore  # noqa: E402
 from common.config import load_app_config, load_dept_keys  # noqa: E402
+from evals.thresholds import MASK_STREAM_FUZZ_CASES  # noqa: E402
 from gateway import sse  # noqa: E402
 from gateway.app import create_app  # noqa: E402
 from gateway.mock_upstream import ECHO_MARKER, MockUpstreamServer  # noqa: E402
@@ -67,6 +74,8 @@ from masking.mapper import (  # noqa: E402
     tolerant_placeholder_hits,
 )
 from masking.remap import MAX_PLACEHOLDER_LEN, StreamRestorer  # noqa: E402
+from outguard import ModerationVerdict, OutguardService  # noqa: E402
+from outguard.fallback import default_texts  # noqa: E402
 from recognizers.models import EntityClass  # noqa: E402
 
 RESULTS: list[tuple[bool, str]] = []
@@ -395,6 +404,73 @@ def step_stream_audit(ctx: dict[str, Any]) -> str:
     return "5 stream requests audited; previews placeholder-version (bytes-level zero raw)"
 
 
+class _FlagAllModerator:
+    """流式输出复检 eval 后端：恒 flagged；记录 redact 承接的调用与效果。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.redact_calls = 0
+        self.redact_input = ""
+        self.redact_output = ""
+
+    def moderate(self, text: str, *, redact=None) -> ModerationVerdict:
+        self.calls += 1
+        if redact is not None:
+            self.redact_calls += 1
+            self.redact_input = text
+            self.redact_output = redact(text)
+        return ModerationVerdict(verdict="flagged", categories=["eval_stream_flag"])
+
+
+def step_stream_output_flagged_audit(ctx: dict[str, Any]) -> str:
+    """流式输出复检 flagged → 审计 flag=output_flagged 留痕（审查加固回归钉）。
+
+    流式 delta 已逐块放行、无法追回，故语义为「检测+留痕」：客户端仍收到
+    完整回答（200 SSE），但事件落库且 flag 如实；复检对象为还原后全文，
+    redact 承接把 PII 表面形式换占位符（原文不在复检判定前出网）。
+    """
+    moderator = _FlagAllModerator()
+    audit = InMemoryAuditStore()
+    app = create_app(cfg=ctx["cfg"], mask_key=MASK_KEY, dept_key_digests=load_dept_keys(),
+                     audit_store=audit,
+                     outguard=OutguardService(default_texts(), ai_label=LABEL,
+                                              moderator=moderator))
+
+    async def run() -> str:
+        async with _gw_client(app) as client:
+            status, headers, frames, raw = await _chat_stream(
+                client, {"messages": [{"role": "user", "content": NORMAL_TEXT}],
+                         "model": "mock-chat", "stream": True},
+                session="sess_stream_flagged")
+        if status != 200 or not headers.get("content-type", "").startswith("text/event-stream"):
+            raise AssertionError(f"flagged stream must still flow: {status}")
+        content = _content_of(_deltas(_parse_events(frames)))
+        if ID_OK not in content or RESTORE_PATTERN.search(content):
+            raise AssertionError(f"client answer broken: {content!r}")
+        if moderator.calls != 1:
+            raise AssertionError(f"moderator calls: {moderator.calls}")
+        # redact 承接：复检后端拿到还原后全文（含原值），经 redact 换占位符
+        if moderator.redact_calls != 1 or ID_OK not in moderator.redact_input:
+            raise AssertionError(f"redact not wired: calls={moderator.redact_calls} "
+                                 f"input={moderator.redact_input!r}")
+        if ID_OK in moderator.redact_output or "〔身份证·" not in moderator.redact_output:
+            raise AssertionError(f"redact output not placeholder version: "
+                                 f"{moderator.redact_output!r}")
+        events = audit.snapshot()
+        if len(events) != 1:
+            raise AssertionError(f"audit rows={len(events)}")
+        if events[0].flags != ["output_flagged"]:
+            raise AssertionError(f"audit flag: {events[0].flags}")
+        if events[0].blocked:
+            raise AssertionError("留痕语义：blocked 按路由决策（输出侧拦截以 flag 区分）")
+        if ID_OK in events[0].response_preview or "〔身份证·" not in events[0].response_preview:
+            raise AssertionError(f"response preview not placeholder version: "
+                                 f"{events[0].response_preview!r}")
+        return ("flagged 后端：200 SSE 照常放行（留痕语义）；审计 flag=output_flagged；"
+                "redact 承接输出占位符版本（零原值）")
+    return asyncio.run(run())
+
+
 def step_stream_upstream_unreachable(ctx: dict[str, Any]) -> str:
     cfg = ctx["cfg"].model_copy(deep=True)
     with socket.socket() as sock:
@@ -468,7 +544,7 @@ def step_remap_fuzz(ctx: dict[str, Any]) -> str:
         if whole != filled:
             raise AssertionError(f"whole-restore sanity failed: {whole!r}")
         pairs.append((masked, filled))
-    for seed in range(300):
+    for seed in range(MASK_STREAM_FUZZ_CASES):
         rnd = random.Random(seed)
         masked, filled = pairs[seed % len(pairs)]
         restorer = StreamRestorer(mapper.lookup)
@@ -476,7 +552,8 @@ def step_remap_fuzz(ctx: dict[str, Any]) -> str:
         out += restorer.flush()
         if out != filled:
             raise AssertionError(f"seed={seed} mismatch:\n out={out!r}\n exp={filled!r}")
-    return "300 chunked-restore fuzz cases == whole-restore (3 templates incl. unknown-placeholder)"
+    return (f"{MASK_STREAM_FUZZ_CASES} chunked-restore fuzz cases == whole-restore "
+            "(3 templates incl. unknown-placeholder)")
 
 
 def step_remap_edges(ctx: dict[str, Any]) -> str:
@@ -560,6 +637,13 @@ def _mangle_forms(ph: str) -> list[tuple[str, str, str, str]]:
         ("corner-brackets", "", f"【{label_full}·{hexpart}】", ""),
         ("ascii-brackets", "", f"[{label_full}·{hexpart}]", ""),
         ("combo-worst", "", f"〔 {label_full} ・ `{hexpart.upper()}` 〕", ""),
+        # U8 INTERNET 腿实锤（prefix-merge）：括号外前缀文案被并入括号内、多出
+        # 冒号段（「主号：〔手机号·…〕」→「〔主号：手机号·…〕」）；只认已知
+        # 标签集，还原=整个括号对替换为原值（并入的前缀段不保真，非 PII 噪声）
+        ("prefix-merged-colon", "", f"{head}主号：{label_full}·{hexpart}{tail}", ""),
+        ("prefix-ascii-colon", "", f"{head}主号: {label_full}·{hexpart}{tail}", ""),
+        ("prefix-multi-segment", "", f"{head}备用联系方式：主号：{label_full}·{hexpart}{tail}", ""),
+        ("prefix-combo-noise", "", f"{head} 主号： {label_full} ・ `{hexpart}` {tail}", ""),
     ]
 
 
@@ -596,6 +680,7 @@ def step_remap_mangled_forms(ctx: dict[str, Any]) -> str:
         "〔本段·没有占位符〕",                  # 完整括号对、摘要非 hex
         "〔未知·deadbeef〕",                    # 规范形状、查表外
         "plain text without any brackets",      # 纯文本
+        "〔备注：本段没有占位符〕",              # 前缀段改形、无 ·hex 摘要 → 非占位符
     ]
     for neg in negatives:
         if mapper.restore(neg) != neg:
@@ -604,12 +689,28 @@ def step_remap_mangled_forms(ctx: dict[str, Any]) -> str:
             continue  # 规范形状属「可辨认占位符」，检测面按泄漏口径应当报告
         if tolerant_placeholder_hits(neg):
             raise AssertionError(f"tolerant detector false positive: {neg!r}")
-    # canonical 单元面：规范化输出恒为规范键形状
+    # U8 prefix-merge 负例：前缀段剥不出已知标签 / 剥到已知标签但映射表外 →
+    # 逐字放行零误替（终审闸=映射表命中）。前两者仍具占位符形状（·hex8），
+    # 按泄漏口径检测面应当报告（同〔未知·deadbeef〕）
+    prefix_negatives = [
+        "〔主号：注意事项·deadbeef〕",           # 末段非已知标签 → 不剥前缀、查表必未命中
+        "〔主号：座机·deadbeef〕",               # 剥到已知标签（座机）但映射表外 → 不得误替
+    ]
+    for neg in prefix_negatives:
+        if mapper.restore(neg) != neg:
+            raise AssertionError(f"false positive on prefix-merge text: {neg!r} -> {mapper.restore(neg)!r}")
+        if not tolerant_placeholder_hits(neg):
+            raise AssertionError(f"placeholder-shaped remnant must be reported: {neg!r}")
+    # canonical 单元面：规范化输出恒为规范键形状（含 prefix-merge 剥前缀至已知标签）
     key = canonical_placeholder(" 手机号 ・ `ABCDEF12` ")
     if key != "〔手机号·abcdef12〕":
         raise AssertionError(f"canonical normalization mismatch: {key!r}")
+    key = canonical_placeholder(" 主号： 手机号 ・ `ABCDEF12` ")
+    if key != "〔手机号·abcdef12〕":
+        raise AssertionError(f"canonical prefix-strip mismatch: {key!r}")
     return (f"{len(_mangle_forms(ph))} known mangle forms restored byte-exact "
-            f"(whole + 3 random-chunk streams each); {len(negatives)} negatives passthrough")
+            f"(whole + 3 random-chunk streams each); "
+            f"{len(negatives) + len(prefix_negatives)} negatives passthrough")
 
 
 async def _fake_byte_chunks(data: bytes, rnd: random.Random) -> AsyncIterator[bytes]:
@@ -667,6 +768,45 @@ def step_sse_byte_layer(ctx: dict[str, Any]) -> str:
     return asyncio.run(run())
 
 
+def step_sse_finalize_tail_callbacks(ctx: dict[str, Any]) -> str:
+    """收尾 flush 残片（未闭合占位符候选，原样放行）必须同口径进 on_content 与
+    on_restored——审查残余销项回归钉：审计 response_preview 与流式输出侧复检
+    不得系统性漏掉流尾残片。"""
+    async def run() -> str:
+        mapper = _fuzz_mapper()
+        masked, _ = mapper.mask(f"号码{PHONE_B}",
+                                [(2, 2 + len(PHONE_B), EntityClass.PHONE_MOBILE, PHONE_B)])
+        ph = next(e.placeholder for e in mapper.entries() if e.type is EntityClass.PHONE_MOBILE)
+        tail = ph[:6]   # 未闭合候选（如 〔手机号·ab），流末由 flush 原样放行
+        payloads = [
+            json.dumps({"choices": [{"index": 0, "delta": {"content": masked},
+                                     "finish_reason": None}]}, ensure_ascii=False),
+            json.dumps({"choices": [{"index": 0, "delta": {"content": tail},
+                                     "finish_reason": None}]}, ensure_ascii=False),
+            json.dumps({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+                       ensure_ascii=False),
+        ]
+        text = "".join(f"data: {p}\n\n" for p in payloads)
+        seen_content: list[str] = []
+        seen_restored: list[str] = []
+        lines = await _drain(sse.compose_chat_stream(
+            _fake_byte_chunks(text.encode("utf-8"), random.Random(3)),
+            mapper=mapper, ai_label=None,
+            on_content=seen_content.append, on_restored=seen_restored.append))
+        client_view = _content_of(_deltas(
+            [json.loads(ln[len("data:"):]) for ln in lines if ln.strip() != "data: [DONE]"]))
+        if tail not in client_view:
+            raise AssertionError(f"flush tail missing from client view: {client_view!r}")
+        for name, parts in (("on_content", seen_content), ("on_restored", seen_restored)):
+            if tail not in "".join(parts):
+                raise AssertionError(f"flush tail missing from {name}: {''.join(parts)!r}")
+        # 主体还原不受影响：客户端正文 = 还原后原文 + 尾片
+        if not client_view.startswith(f"号码{PHONE_B}"):
+            raise AssertionError(f"main restore broken: {client_view!r}")
+        return f"flush tail {tail!r} present in client view + on_content + on_restored"
+    return asyncio.run(run())
+
+
 STEPS = (
     ("fixtures:start-and-config", step_fixtures),
     ("stream:normal-restored-labeled", step_stream_normal),
@@ -675,11 +815,13 @@ STEPS = (
     ("stream:tool-call-hold-restore", step_stream_tool_call),
     ("stream:clean-passthrough", step_stream_clean),
     ("stream:audit-previews", step_stream_audit),
+    ("stream:output-flagged-audit", step_stream_output_flagged_audit),
     ("stream:upstream-unreachable-502", step_stream_upstream_unreachable),
     ("remap:chunked-fuzz-300", step_remap_fuzz),
     ("remap:edge-cases", step_remap_edges),
     ("remap:mangled-forms", step_remap_mangled_forms),
     ("sse:byte-level-partial-lines", step_sse_byte_layer),
+    ("sse:finalize-tail-callbacks", step_sse_finalize_tail_callbacks),
 )
 
 

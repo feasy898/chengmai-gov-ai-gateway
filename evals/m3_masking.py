@@ -10,8 +10,10 @@ exit 0 = 通过。检查项（开发指令 §6 M3 eval 口径，阈值取 evals/
 2. 归一化等价：全角/空格/分隔符/前缀变体 → 同 normalized → 同占位符（§5.3.2）；
 3. 流式 fuzz：500 条随机 1–7 字符切块用例，``feed()*k + flush()`` 与整段还原全等；
 3b. 改形还原（T8.4）：模型对占位符 token 的已知改形（反引号/空白/换行/全半角/
-   大小写/易混字符/同形括号·间隔号/组合）整段与流式还原全等；工具参数 JSON 内
-   改形占位符经 restore_arguments 仍可解析且原值在位；非占位符文本零误替；
+   大小写/易混字符/同形括号·间隔号/括号外前缀文案并入括号内（「主号：〔手机号·…〕」
+   →「〔主号：手机号·…〕」，U8 INTERNET 腿实锤）/组合）整段与流式还原全等；
+   工具参数 JSON 内改形占位符经 restore_arguments 仍可解析且原值在位；
+   非占位符文本零误替；
 4. 工具调用还原（T2.3 补：流式 hold-to-finish）：
    - 含中文参数 JSON 的 delta 序列（arguments 被切成任意碎片、占位符跨 chunk）：
      finish 前零发出、finish 时**单个 delta** 整体还原，JSON 可解析、原值在位、
@@ -222,9 +224,14 @@ def step_mangled_forms() -> str:
     """模型对占位符 token 的已知改形 → 还原必须命中（构造样本直测，不依赖模型随机性）。
 
     改形面：反引号包裹/内嵌、空白与换行插入拆开、hex 大小写/全半角、易混字符
-    （O→0、l→1）、同形括号（〔→【[）与间隔号（·→・•.）转写、组合改形——
-    与直连探针实测清单（evals/u8_repro）同源并外延。负例：非占位符的同形
-    括号文本 / markdown 链接零误替。另测工具参数 JSON 内改形占位符。
+    （O→0、l→1）、同形括号（〔→【[）与间隔号（·→・•.）转写、括号外前缀文案
+    并入括号内且多出冒号段（「主号：〔手机号·…〕」→「〔主号：手机号·…〕」，
+    U8 INTERNET 腿实锤三样本同型：〔主号：手机号·9cfd96c0〕/〔备用号：手机号·
+    1522ba0d〕/〔备用号：手机号·b44eb16e〕；只认已知标签集，并入的前缀段随
+    括号对一并被替换、不参与正文保真）、组合改形——与直连探针实测清单
+    （evals/u8_repro）同源并外延。负例：非占位符的同形括号文本 / markdown
+    链接 / 前缀段剥不出已知标签或映射表外的改形——零误替。另测工具参数
+    JSON 内改形占位符。
     """
     mapper = SessionMapper("sess_m3_mangled", MASK_KEY.encode())
     masked, _entries = mapper.mask(
@@ -257,6 +264,13 @@ def step_mangled_forms() -> str:
         ("ascii-brackets", f"[{label}·{hexpart}]", PHONE_OK),
         ("corner-brackets", f"【{label}·{hexpart}】", PHONE_OK),
         ("combo-worst", f"〔 {label} ・ `{hexpart.upper()}` 〕", PHONE_OK),
+        # U8 INTERNET 腿实锤（prefix-merge）：括号外前缀文案被并入括号内、多出
+        # 冒号段（「主号：〔手机号·…〕」→「〔主号：手机号·…〕」）；只认已知
+        # 标签集，还原=整个括号对替换为原值（并入的前缀段不保真，非 PII 噪声）
+        ("prefix-merged", f"〔主号：{label}·{hexpart}〕", PHONE_OK),
+        ("prefix-ascii-colon", f"〔主号: {label}·{hexpart}〕", PHONE_OK),
+        ("prefix-multi-segment", f"〔备用联系方式：主号：{label}·{hexpart}〕", PHONE_OK),
+        ("prefix-combo-noise", f"〔 主号： {label} ・ `{hexpart}` 〕", PHONE_OK),
     ]
     for name, mangled, expected_slot in forms:
         form_text = masked.replace(ph, mangled)
@@ -271,9 +285,9 @@ def step_mangled_forms() -> str:
             out = "".join(r.feed(p) for p in _split_chars(form_text, random.Random(seed))) + r.flush()
             if out != expected:
                 raise AssertionError(f"[{name}] stream-restore(seed={seed}) mismatch: {out!r}")
-    # 负例：非占位符文本零误替
+    # 负例：非占位符文本零误替（prefix-merge 负例：剥不出已知标签/映射表外 → 放行）
     for neg in ("【注·见附件】", "[链接](https://example.com)", "〔本段·没有占位符〕",
-                "〔未知·deadbeef〕"):
+                "〔未知·deadbeef〕", "〔主号：注意事项·deadbeef〕", "〔主号：座机·deadbeef〕"):
         if mapper.restore(neg) != neg:
             raise AssertionError(f"false positive: {neg!r} -> {mapper.restore(neg)!r}")
     # 工具参数 JSON 内的改形占位符：restore_arguments 后仍可解析、原值在位
@@ -286,7 +300,7 @@ def step_mangled_forms() -> str:
     if PERSON_OK not in restored:
         raise AssertionError(f"mangled tool args person not restored: {restored!r}")
     return (f"{len(forms)} known mangle forms restored (whole + 2 chunked streams each); "
-            f"4 negatives passthrough; mangled placeholder in tool-args JSON still restores")
+            f"6 negatives passthrough; mangled placeholder in tool-args JSON still restores")
 
 
 # ── 4. 工具调用还原（T2.3：流式 hold-to-finish + 跨 chunk 切分）────────

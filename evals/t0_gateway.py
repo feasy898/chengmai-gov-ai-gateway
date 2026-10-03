@@ -23,12 +23,17 @@ exit 0 = 通过。检查项（对应任务单 T0.4 完成定义：普通样例�
     正确、preview 为占位符版本；密级事件 blocked=true、upstream=null；
     全部 preview bytes 级扫描零原值；零明文硬闸直测（泄漏原值 → RawPiiLeakError 不落库）；
 11. /internal/detect：fid 请求内自增；/internal/anonymize + /internal/restore 双向往返；
-12. 上游不可达 → 502 upstream_error 信封。
+12. 上游不可达 → 502 upstream_error 信封；
+13. 出站全量检测面（审查加固回归钉）：消息级 name/自定义字段与 dict 键同过
+    detect→mask、出站重建零原值透传；密级词藏消息级字段 → 整单拦截；
+14. 会话属主绑定（审查加固回归钉）：先到先得，跨部门聊天/还原 → 403；
+    被 400 拒绝的畸形请求不留属主绑定（先校验后绑定）。
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import socket
 import sys
@@ -57,6 +62,7 @@ RESULTS: list[tuple[bool, str]] = []
 
 DEPT = "民政局"
 DEMO_KEY = "dk_5e6f7a8b"  # 演示明文（.env.example 文档化；YAML 只存 sha256）
+TOWN_KEY = "dk_9c0d1e2f"  # 某镇演示明文（.env.example 文档化；YAML 只存 sha256）
 MASK_KEY = "cd" * 32
 
 ID_OK = "11010519491231002X"          # GB11643 校验位有效的样例号
@@ -141,6 +147,7 @@ def step_fixtures(ctx: dict[str, Any]) -> str:
     ctx["app"] = create_app(cfg=cfg, mask_key=MASK_KEY, dept_key_digests=digests,
                             audit_store=ctx["audit"])
     ctx["cfg"] = cfg
+    ctx["digests"] = digests
     return "mocks on :8901/:8902 reset; gateway app with real config + in-memory audit"
 
 
@@ -395,6 +402,110 @@ def step_internal_endpoints(ctx: dict[str, Any]) -> str:
     return asyncio.run(run())
 
 
+def step_outbound_face(ctx: dict[str, Any]) -> str:
+    """出站全量检测面（审查 §A1/A4 及其消息级残余的回归钉）：
+    消息级 ``name`` / 自定义字段与 dict 键同过 detect→mask，出站重建
+    ``messages[*]`` 与 ``messages``/``stream`` 之外均无原样透传面；
+    密级词藏在消息级字段同样整单拦截（403），上游零感知。"""
+    async def run() -> str:
+        service: GatewayService = ctx["app"].state.service
+        body: dict[str, Any] = {
+            "model": "mock-chat",
+            "metadata": {ID_B: "trace"},          # PII 藏在顶层 dict 键
+            "messages": [
+                {"role": "user", "name": f"张三 {ID_OK}", "content": CLEAN_TEXT},
+                {"role": "user", "content": CLEAN_TEXT, "ext": {"nested": [ID_C]}},
+            ],
+        }
+        prep = service._prepare(body, session_id="sess_eval_face", request_id="req_face")
+        upstream = service._resolve_upstream(prep.decision)
+        if upstream is None:
+            raise AssertionError("route target missing")
+        out = service._out_payload(body, prep, upstream, stream=False)
+        name_out = out["messages"][0]["name"]
+        if "〔" not in name_out or ID_OK in name_out or "张三" in name_out:
+            raise AssertionError(f"message-level name not masked: {name_out!r}")
+        nested = out["messages"][1]["ext"]["nested"]
+        if any(ID_C in piece for piece in nested):
+            raise AssertionError(f"message-level custom field not masked: {nested!r}")
+        meta_keys = list(out["metadata"].keys())
+        if any(ID_B in k for k in meta_keys) or not any("〔" in k for k in meta_keys):
+            raise AssertionError(f"dict key not masked: {meta_keys!r}")
+        blob = json.dumps(out, ensure_ascii=False).encode("utf-8")
+        for raw in (ID_OK, ID_B, ID_C, "张三"):
+            if raw.encode("utf-8") in blob:
+                raise AssertionError(f"raw value {raw!r} survived outbound rebuild")
+        # 密级词藏在消息级字段 → 整单拦截
+        srv1: MockUpstreamServer = ctx["srv1"]
+        before = len(srv1.ring)
+        body2 = {"model": "mock-chat",
+                 "messages": [{"role": "user", "name": "机密★名单", "content": CLEAN_TEXT}]}
+        result = await service.handle_chat(body2, dept=DEPT, session_id="sess_eval_face_b",
+                                           request_id="req_face_b")
+        if result.status_code != 403 or result.payload["error"]["code"] != "content_blocked":
+            raise AssertionError(f"classified word in message field: {result.status_code}")
+        if len(srv1.ring) != before:
+            raise AssertionError("blocked request reached an upstream")
+        return ("message-level name/custom fields + dict keys masked/renamed (no raw out); "
+                "classified word in message field -> 403, upstream untouched")
+    return asyncio.run(run())
+
+
+def step_session_owner_binding(ctx: dict[str, Any]) -> str:
+    """会话属主绑定（审查加固回归钉）：先到先得，跨部门复用/还原一律 403；
+    被 400 拒绝的畸形请求**不**留属主绑定（先校验后绑定——若绑定先于校验，
+    某镇可用垃圾请求抢占 session_id，下方 r4 即 403）。"""
+    async def run() -> str:
+        digests = ctx["digests"]
+        if digests["某镇"] != hashlib.sha256(TOWN_KEY.encode()).hexdigest():
+            raise AssertionError("town demo key (.env.example) out of sync with dept_keys.yaml")
+        srv1: MockUpstreamServer = ctx["srv1"]
+        before = len(srv1.ring)
+        owner_h = _auth_headers("sess_owner_x")
+        other_h = {"Authorization": f"Bearer {TOWN_KEY}", "x-anongw-session-id": "sess_owner_x"}
+        async with _gw_client(ctx["app"]) as client:
+            r1 = await client.post("/v1/chat/completions",
+                                   json=_chat_body(CLEAN_TEXT), headers=owner_h)
+            if r1.status_code != 200:
+                raise AssertionError(f"owner first use: {r1.status_code}")
+            r2 = await client.post("/v1/chat/completions",
+                                   json=_chat_body(CLEAN_TEXT), headers=other_h)
+            if r2.status_code != 403 or r2.json()["error"]["code"] != "unauthorized":
+                raise AssertionError(f"cross-dept chat reuse: {r2.status_code} {r2.text[:120]!r}")
+            # 畸形请求 400 且不绑定 sess_owner_y；随后民政局首用同 session 须成功
+            r3 = await client.post("/v1/chat/completions", json={"messages": []},
+                                   headers={"Authorization": f"Bearer {TOWN_KEY}",
+                                            "x-anongw-session-id": "sess_owner_y"})
+            if r3.status_code != 400:
+                raise AssertionError(f"garbage body: {r3.status_code}")
+            r4 = await client.post("/v1/chat/completions", json=_chat_body(CLEAN_TEXT),
+                                   headers={**_auth_headers(), "x-anongw-session-id": "sess_owner_y"})
+            if r4.status_code != 200:
+                raise AssertionError(
+                    f"owner bind after rejected garbage: {r4.status_code} {r4.text[:120]!r}")
+            # 还原面属主闸：他部门还原 owner 会话 → 403；owner 双向往返可用
+            r5 = await client.post("/internal/restore",
+                                   json={"text": "证件〔身份证·deadbeef〕", "session_id": "sess_owner_x"},
+                                   headers={"Authorization": f"Bearer {TOWN_KEY}"})
+            if r5.status_code != 403:
+                raise AssertionError(f"cross-dept restore: {r5.status_code} {r5.text[:120]!r}")
+            r6 = await client.post("/internal/anonymize",
+                                   json={"text": f"证件{ID_OK}", "session_id": "sess_owner_x"},
+                                   headers={"Authorization": f"Bearer {DEMO_KEY}"})
+            if r6.status_code != 200:
+                raise AssertionError(f"owner anonymize: {r6.status_code}")
+            r7 = await client.post("/internal/restore",
+                                   json={"text": r6.json()["masked"], "session_id": "sess_owner_x"},
+                                   headers={"Authorization": f"Bearer {DEMO_KEY}"})
+            if r7.status_code != 200 or r7.json()["restored"] != f"证件{ID_OK}":
+                raise AssertionError(f"owner restore roundtrip: {r7.status_code} {r7.text[:160]!r}")
+        if len(srv1.ring) != before + 2:
+            raise AssertionError(f"ring delta {len(srv1.ring) - before}")
+        return ("cross-dept chat/restore -> 403; owner anonymize+restore ok; "
+                "400 garbage leaves no owner binding (validate-then-bind)")
+    return asyncio.run(run())
+
+
 def step_upstream_unreachable(ctx: dict[str, Any]) -> str:
     cfg = ctx["cfg"].model_copy(deep=True)
     with socket.socket() as sock:
@@ -426,6 +537,8 @@ STEPS = (
     ("chat:clean-passthrough", step_clean_text),
     ("audit:in-memory-store", step_audit),
     ("audit:raw-pii-gate", step_audit_raw_gate),
+    ("outbound:full-detection-face", step_outbound_face),
+    ("session:owner-binding", step_session_owner_binding),
     ("internal:detect-anonymize-restore", step_internal_endpoints),
     ("upstream:unreachable-502", step_upstream_unreachable),
 )

@@ -65,12 +65,18 @@ if str(REPO_ROOT) not in sys.path:
 from audit.models import AuditEvent  # noqa: E402
 from audit.query import CSV_HEADERS  # noqa: E402
 from audit.store import (  # noqa: E402
+    DEAD_LETTER_SUFFIX,
     RawPiiLeakError,
     assert_db_no_raw_pii,
     assert_no_raw_pii,
     scan_db_files,
 )
-from audit.writer import SqliteAuditWriter, count_events, read_events  # noqa: E402
+from audit.writer import (  # noqa: E402
+    SqliteAuditWriter,
+    connect_db,
+    count_events,
+    read_events,
+)
 from common.config import AppConfig  # noqa: E402
 from evals.thresholds import (  # noqa: E402
     AUDIT_ADMIN_EVENTS,
@@ -315,6 +321,32 @@ def check_db_file_scan_negative_control() -> str:
             return "poisoned row (in -wal) caught by bytes-level scan → RawPiiLeakError(db_file_scan)"
         finally:
             writer.close()
+
+
+def check_dead_letter_file_in_scan_set() -> str:
+    """死信文件（``<db>.dead_letter.jsonl``）必须在 bytes 级扫描集内（审查残余销项）。
+
+    负控：毒值写进死信文件 → :func:`assert_db_no_raw_pii` 必须命中——第二道
+    防线对死信落盘面同样生效；移除死信文件后扫描面回归原样（主库+旁挂零命中）。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _tmp_db(tmp, "dl.db")
+        Path(str(db) + DEAD_LETTER_SUFFIX).write_text(f"身份证{ID_A}", encoding="utf-8")
+        try:
+            assert_db_no_raw_pii(db, RAW_VALUES)
+        except RawPiiLeakError as exc:
+            if exc.kind != "db_file_scan":
+                raise AssertionError(f"kind={exc.kind}") from exc
+        else:
+            raise AssertionError("scanner missed the dead-letter file — 假绿")
+        # 移除死信文件：无该落盘面时扫描行为不变（主库+旁挂仍在扫描集内）
+        Path(str(db) + DEAD_LETTER_SUFFIX).unlink()
+        conn = connect_db(db)   # 建真实库文件（schema 在位，WAL 模式）
+        conn.close()
+        scanned = assert_db_no_raw_pii(db, RAW_VALUES)
+        if scanned <= 0:
+            raise AssertionError("scanned 0 bytes — scan target missing")
+    return "dead-letter file in scan set (poison hit → db_file_scan); absent file keeps scan intact"
 
 
 # ── C. 会话存储 ─────────────────────────────────────────────────────
@@ -803,6 +835,7 @@ CHECKS = (
     ("gate:raw-pii-pre-enqueue", check_gate_blocks_before_enqueue),
     ("gate:db-file-bytes-scan", check_db_file_scan_zero_hit),
     ("gate:scan-negative-control", check_db_file_scan_negative_control),
+    ("gate:dead-letter-file-in-scan-set", check_dead_letter_file_in_scan_set),
     ("session:stability(100)", check_session_stability),
     ("session:persistence-reopen", check_session_persistence_reopen),
     ("session:lru-revive", check_session_lru_revive),
