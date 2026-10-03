@@ -8,12 +8,13 @@ gateway 只依赖本类（构造一次、随 :class:`gateway.pipeline.GatewaySer
 """
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 from common.config import REPO_ROOT, AppConfig
 from outguard.fallback import DEFAULT_TEXTS_PATH, block_message, load_texts
 from outguard.models import ModerationVerdict, OutguardTexts
-from outguard.moderation import NullModerator, OutputModerationBackend, verdict_of
+from outguard.moderation import NullModerator, OutputModerationBackend, RedactFn, verdict_of
 from routing.models import RouteDecision
 
 
@@ -30,6 +31,10 @@ class OutguardService:
         self.texts = texts
         self.ai_label = (ai_label or "").strip()
         self.moderator: OutputModerationBackend = moderator if moderator is not None else NullModerator()
+        # 后端是否声明 redact 形参（构造期定死；审查加固脱敏承接的兼容判定——
+        # 旧式两参后端未声明时不传该关键字参数，行为与此前完全一致）
+        self._backend_takes_redact = "redact" in inspect.signature(
+            self.moderator.moderate).parameters
 
     @classmethod
     def from_config(
@@ -51,6 +56,16 @@ class OutguardService:
         return block_message(self.texts, decision, prompt_masked)
 
     # ── 输出侧复检钩子（§6 M5：moderate(response) 接口）───────────
-    def moderate(self, text: str) -> ModerationVerdict:
-        """复检（还原后的）响应文本；判定经 :func:`verdict_of` 归一化。"""
+    def moderate(self, text: str, *, redact: RedactFn | None = None) -> ModerationVerdict:
+        """复检（还原后的）响应文本；判定经 :func:`verdict_of` 归一化。
+
+        ``redact``：可选脱敏承接（审查加固）：调用方传入的 ``str -> str``
+        纯函数（网关侧为「PII/密级表面形式 → 会话占位符/拦截占位」，与输入侧
+        judge 脱敏同口径）——后端若把文本发往外部端点，必须先经它换占位符，
+        原文不在复检判定前出网。后端未声明 ``redact`` 形参（旧式实现）时不传，
+        行为与此前完全一致；P0 :class:`NullModerator` 声明并忽略之，恒 safe
+        零变化。
+        """
+        if redact is not None and self._backend_takes_redact:
+            return verdict_of(self.moderator.moderate(text, redact=redact))
         return verdict_of(self.moderator.moderate(text))

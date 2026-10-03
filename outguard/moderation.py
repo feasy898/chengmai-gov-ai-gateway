@@ -3,11 +3,19 @@
 - **P0（铁律 D）**：:class:`NullModerator` 恒 ``safe``——无审核模型时降级为
   "未发现风险"，主链路零影响、零阻塞；
 - **P1（采样执行）**：接语义审核模型 response 侧——后端实现
-  :class:`OutputModerationBackend` 协议（``moderate(text) -> ModerationVerdict``，
-  词汇与语义审核适配器一致：``safe | flagged`` + categories），注入
-  :class:`outguard.service.OutguardService`；``flagged`` → 网关按 content_blocked
-  拦截本次响应（reasons code=``OUTPUT_MODERATION``）。模型路径配置只写
-  ``config.app.moderation_model``（公开仓库卫生，模型名不进源码）。
+  :class:`OutputModerationBackend` 协议（``moderate(text, *, redact=None) ->
+  ModerationVerdict``，词汇与语义审核适配器一致：``safe | flagged`` +
+  categories），注入 :class:`outguard.service.OutguardService`；``flagged`` →
+  网关按 content_blocked 拦截本次响应（reasons code=``OUTPUT_MODERATION``）。
+  模型路径配置只写 ``config.app.moderation_model``（公开仓库卫生，模型名不进
+  源码）。
+
+脱敏承接（审查加固，与输入侧 judge 脱敏同口径）：输出复检对象是**还原后**
+文本（含原值）；后端若会把文本发往外部端点（如 ``SEMANTIC_JUDGE_BASE_URL``），
+必须先经 ``redact`` 参数把 PII/密级表面形式换为占位符——原文不在脱敏/BLOCK
+判定前出网（输入侧参照 :meth:`recognizers.semantic.adapter.SemanticAdapter.
+_redact_for_judge`）。``redact`` 为可选关键字参数（缺省 ``None`` = 原样复检），
+调用方经 :meth:`outguard.service.OutguardService.moderate` 传入。
 
 接线现状（M5 范围）：非流式路径在**还原后**对首 choice 正文执行复检
 （gateway/pipeline.py）；流式路径为 P1 采样执行预留（流收尾取还原前占位符版
@@ -15,24 +23,35 @@
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
 from outguard.models import ModerationVerdict
 
+#: 可选脱敏承接函数形状：还原后文本 → 占位符版本（单参、纯函数）
+RedactFn = Callable[[str], str]
+
 
 @runtime_checkable
 class OutputModerationBackend(Protocol):
-    """输出复检后端协议：``moderate(text) -> ModerationVerdict``（P1 实现此形状）。"""
+    """输出复检后端协议：``moderate(text, *, redact=None)``（P1 实现此形状）。
 
-    def moderate(self, text: str) -> ModerationVerdict:
+    ``redact``：可选脱敏承接（见模块 docstring）——后端向外部端点发送文本前
+    必须经它换占位符；不做外发的本地后端可声明并忽略之。
+    """
+
+    def moderate(self, text: str, *, redact: RedactFn | None = None) -> ModerationVerdict:
         """对（还原后的）响应文本做风险复检；实现必须无副作用、可采样调用。"""
         ...
 
 
 class NullModerator:
-    """P0 空审核后端：恒 ``safe``（接口占位；语义审核模型后端就位后整体替换）。"""
+    """P0 空审核后端：恒 ``safe``（接口占位；语义审核模型后端就位后整体替换）。
 
-    def moderate(self, text: str) -> ModerationVerdict:
+    ``redact`` 仅声明协议承接、从不调用——P0 行为零变化（无外发面，无需脱敏）。
+    """
+
+    def moderate(self, text: str, *, redact: RedactFn | None = None) -> ModerationVerdict:
         return ModerationVerdict(verdict="safe")
 
 
