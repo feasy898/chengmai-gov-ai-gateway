@@ -83,6 +83,9 @@ FORWARD_URL = os.environ.get("LLM_FORWARD_URL", "").rstrip("/")
 FORWARD_MODEL = os.environ.get("LLM_FORWARD_MODEL", "")  # 后端真实模型名（空=透传原样）
 FORWARD_TIMEOUT_S = float(os.environ.get("LLM_FORWARD_TIMEOUT_S", "300"))
 FORWARD_EXTRA: dict[str, Any] = json.loads(os.environ.get("LLM_FORWARD_EXTRA_JSON", "{}") or "{}")
+# 后端最小鉴权（LM-05 收敛面）：推理 POST 需 Bearer。值经 env 提供（run_gpu.sh 可从
+# chmod 600 的 forward_key 文件注入），恒不落盘/不入日志/不回显。
+FORWARD_KEY = os.environ.get("LLM_FORWARD_KEY", "").strip()
 _HEALTH_CACHE_TTL_S = 3.0
 _health_cache: dict[str, Any] = {"ts": 0.0, "ok": False}
 
@@ -238,7 +241,12 @@ def _vram_info() -> dict[str, Any]:
 
 
 def _forward_backend_ok() -> bool:
-    """透传后端可达性探测（3s 缓存）；/health 的 loaded 与请求前置都以此为准。"""
+    """透传后端可达性探测（3s 缓存）；/health 的 loaded 与请求前置都以此为准。
+
+    判定口径：**任何 HTTP 应答（含 404/401）都算可达**——探测只回答「TCP+HTTP
+    栈活着」，模型清单路径未被网关路由（如按模型路由的 AI 网关）不应误报离线；
+    连接失败/超时才报 not loaded。
+    """
     now = time.monotonic()
     if now - float(_health_cache.get("ts") or 0) < _HEALTH_CACHE_TTL_S:
         return bool(_health_cache["ok"])
@@ -247,7 +255,9 @@ def _forward_backend_ok() -> bool:
         req = urllib.request.Request(f"{FORWARD_URL}/models", method="GET")
         with urllib.request.urlopen(req, timeout=5) as resp:
             ok = resp.status == 200
-    except Exception:  # noqa: BLE001 —— 任何探测失败都如实报 not loaded
+    except urllib.error.HTTPError:
+        ok = True  # 后端有 HTTP 应答（含 404/401）＝栈可达；路由面差异不算离线
+    except Exception:  # noqa: BLE001 —— 连接失败/超时才如实报 not loaded
         ok = False
     _health_cache.update({"ts": now, "ok": ok})
     return ok
@@ -455,6 +465,14 @@ def _forward_ring(payload: dict[str, Any], request: Request, want_stream: bool) 
     })
 
 
+def _forward_headers() -> dict[str, str]:
+    """转发请求头；后端鉴权在位（FORWARD_KEY 非空）时附 Bearer（值恒不落日志）。"""
+    headers = {"Content-Type": "application/json"}
+    if FORWARD_KEY:
+        headers["Authorization"] = f"Bearer {FORWARD_KEY}"
+    return headers
+
+
 def _forward_non_stream(payload: dict[str, Any]) -> Any:
     """非流式：urllib 转发（GPU 机 venv 无 httpx，只用标准库）+ 模型名归一。"""
     from fastapi import HTTPException
@@ -463,7 +481,7 @@ def _forward_non_stream(payload: dict[str, Any]) -> Any:
     req = urllib.request.Request(
         f"{FORWARD_URL}/chat/completions",
         data=json.dumps(_forward_payload(payload), ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=_forward_headers(),
         method="POST",
     )
     t0 = time.perf_counter()
@@ -490,7 +508,7 @@ def _forward_stream(payload: dict[str, Any]) -> Any:
         req = urllib.request.Request(
             f"{FORWARD_URL}/chat/completions",
             data=json.dumps(_forward_payload(payload), ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=_forward_headers(),
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=FORWARD_TIMEOUT_S) as resp:
