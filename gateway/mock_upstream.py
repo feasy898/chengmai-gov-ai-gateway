@@ -406,6 +406,10 @@ class MockUpstreamServer:
 
 def main(argv: list[str] | None = None) -> int:
     """CLI 入口：``python -m gateway.mock_upstream --port 8901``（阻塞至 Ctrl+C）。"""
+    # Windows 编码纪律（与 ops.e2e_smoke / gateway.__main__ 同口径）：入口先重配 UTF-8
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(
         prog="gateway.mock_upstream",
         description="Mock 上游：OpenAI 兼容 /v1/chat/completions（回显 + ring buffer）",

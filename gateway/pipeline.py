@@ -17,11 +17,18 @@
 
 范围与取舍（后续任务扩展时保持类与方法形状）：
 - 出站**全量检测面**（审查 §A1/A4）：除消息 content 文本段外，``tools`` 定义、
-  历史消息 ``tool_calls`` / ``function_call``、非 text 多模态段的字符串叶节点
-  全部过 detect→mask；任一 BLOCK_FLAG 命中（含密级词藏在上述任意位置）整单拦截；
+  历史消息 ``tool_calls`` / ``function_call``、非 text 多模态段的字符串叶节点、
+  顶层与其余全部字段的字符串叶**及 dict 键**、消息级非 content 字段（``name``
+  等自定义字段）全部过 detect→mask；任一 BLOCK_FLAG 命中（含密级词藏在上述
+  任意位置）整单拦截——``messages``/``stream`` 之外无任何原样透传面；
 - 多段 content：文本段逐段检测/脱敏后原位替换，非文本段的字符串叶同样过检测面；
 - BLOCK/上游不可达/上游协议错误在**开流前**决出，仍返回普通 JSON 信封；
   开流后（已 200）的中途断流只能以 SSE 错误事件收尾；
+- 输出侧复检（§6 M5 moderate）流式同样接线（审查加固）：流收尾对**还原后**
+  全文复检，flagged → 响亮记日志 + 审计 flag=output_flagged 留痕。流式 delta
+  已逐块放行、内容不可追回，故流式复检为「检测+留痕」语义（非流式为拦截），
+  P0 NullModerator 恒 safe 零影响；P1 换真后端时如需流式拦截语义须改为
+  有界缓冲放行（契约扩展点，此处声明）；
 - 流式审计在流收尾时落账（response_preview 为**还原前**占位符版本）；
   零明文硬闸失败时事件不落库并大声记日志（流已 200，500 无法回传）。
 
@@ -57,10 +64,11 @@ from gateway.provider import (
     open_stream_chat,
 )
 from masking.mapper import SessionMapper, SessionRegistry
-from masking.toolbuf import restore_arguments
+from masking.toolbuf import ToolArgumentsOverflowError, restore_arguments
 from outguard.fallback import DEFAULT_BLOCK_DEFAULT
 from outguard.label import HEADER_AI_LABEL, apply_message_label
 from outguard.models import ModerationVerdict
+from outguard.moderation import RedactFn
 from outguard.service import OutguardService
 from recognizers.models import EntityClass, Finding
 from recognizers.pipeline import detect_full
@@ -110,6 +118,14 @@ class ChatBodyError(ValueError):
     """请求体校验失败（映射 400 bad_request）。"""
 
 
+class SessionOwnerError(RuntimeError):
+    """会话属主不符（会话已被其他部门绑定；映射 403，审查加固：跨部门还原链封死）。"""
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__(f"session {session_id!r} belongs to another department")
+
+
 @dataclass
 class GatewayResult:
     """非流式单次请求处理结果：HTTP 状态码 + 响应 JSON + 追加响应头。"""
@@ -153,68 +169,89 @@ def _content_segments(content: Any, msg_index: int) -> list[_Segment]:
     return []
 
 
-def _iter_string_leaves(obj: Any):
-    """递归产出 JSON 结构中的字符串叶节点；字符串值本身不再下探。"""
+def _iter_string_leaves(obj: Any, *, include_keys: bool = False):
+    """递归产出 JSON 结构中的字符串叶节点；字符串值本身不再下探。
+
+    ``include_keys=True`` 时同时产出 dict 的**键**（键同样是出站字符串——审查
+    加固：藏 PII/密级词的 metadata/工具 schema 键不得绕过检测面；重建时按同一
+    映射换名，见 :func:`_apply_aux_masked`）。
+    """
     if isinstance(obj, dict):
-        for value in obj.values():
+        for key, value in obj.items():
+            if include_keys:
+                yield key
             if isinstance(value, str):
                 yield value
             else:
-                yield from _iter_string_leaves(value)
+                yield from _iter_string_leaves(value, include_keys=include_keys)
     elif isinstance(obj, list):
         for value in obj:
             if isinstance(value, str):
                 yield value
             else:
-                yield from _iter_string_leaves(value)
+                yield from _iter_string_leaves(value, include_keys=include_keys)
 
 
 def _aux_texts(body: dict[str, Any]) -> list[str]:
     """出站**辅助检测面**的字符串全集（去重前）：
 
-    - ``tools`` 定义（function.description / parameters 说明等全部字符串叶）；
+    - ``tools`` 定义（function.description / parameters 说明等全部字符串叶**与键**）；
     - 历史消息的 ``tool_calls``（含每条 function 的 name/arguments）与
       ``function_call``（legacy 形态）——PII/密级词常藏在历史参数里；
-    - content 中**非 text** 多模态段的字符串叶（如 image_url 的 data URL、alt 文本）。
+    - 消息级**非 content 字段**（``name`` 及任意自定义字段）的字符串值与嵌套
+      叶——审查残余销项：``messages[*]`` 内除 content 外不得有原样透传面；
+    - content 中**非 text** 多模态段的字符串叶（如 image_url 的 data URL、alt 文本）；
+    - 顶层标量字符串（``user``、字符串形态 ``stop`` 等）与**其余全部顶层
+      dict/list 字段**（``metadata``、``response_format``、``logit_bias``…）的
+      字符串叶**与 dict 键**——审查加固：``messages``/``stream`` 之外的顶层字段
+      同样过全检测面，藏于其中的 PII/密级词不得绕过脱敏直达上游（模块
+      docstring「出站全量检测面」）。
 
     content 的 str 段与 ``type=="text"`` 段由 :func:`_content_segments` 主面覆盖，
     不在此重复。
     """
     texts: list[str] = []
-    tools = body.get("tools")
-    if isinstance(tools, list):
-        for tool in tools:
-            texts.extend(_iter_string_leaves(tool))
+    for key, value in body.items():
+        if key in ("messages", "stream"):
+            continue  # messages 由主面+消息级辅助面覆盖；stream 是布尔开关
+        if isinstance(value, str):
+            texts.append(value)
+        elif isinstance(value, (dict, list)):
+            texts.extend(_iter_string_leaves(value, include_keys=True))
     for message in body.get("messages") or []:
         if not isinstance(message, dict):
             continue
-        for key in ("tool_calls", "function_call"):
-            value = message.get(key)
-            if isinstance(value, dict):
-                texts.extend(_iter_string_leaves(value))
-            elif isinstance(value, list):
-                for call in value:
-                    if isinstance(call, (dict, list)):
-                        texts.extend(_iter_string_leaves(call))
+        for m_key, m_value in message.items():
+            if m_key == "content":
+                continue  # str 段与 type=="text" 段由主面覆盖；非 text 段见下
+            if isinstance(m_value, str):
+                texts.append(m_value)
+            elif isinstance(m_value, (dict, list)):
+                # tool_calls / function_call / name / 任意自定义字段的叶与键
+                texts.extend(_iter_string_leaves(m_value, include_keys=True))
         content = message.get("content")
         if isinstance(content, list):
             for piece in content:
                 if isinstance(piece, str) or (isinstance(piece, dict) and piece.get("type") == "text"):
                     continue
                 if isinstance(piece, (dict, list)):
-                    texts.extend(_iter_string_leaves(piece))
+                    texts.extend(_iter_string_leaves(piece, include_keys=True))
     return texts
 
 
 def _apply_aux_masked(obj: Any, masked: dict[str, str]) -> Any:
-    """深拷贝式出站重建：dict/list 结构中的字符串叶按 ``原文 → 脱敏文`` 映射替换。
+    """深拷贝式出站重建：dict/list 结构中的字符串叶**与 dict 键**按
+    ``原文 → 脱敏文`` 映射替换。
 
-    映射中没有的字符串原样保留（与出站检测面同一全集，未映射即未检出）。
+    映射中没有的字符串原样保留（与出站检测面同一全集，未映射即未检出）；
+    键换名仅发生在键原文命中映射时（结构与值形状不变——审查残余销项：藏 PII
+    的 metadata/工具 schema 键不再原样出网）。
     """
     if isinstance(obj, str):
         return masked.get(obj, obj)
     if isinstance(obj, dict):
-        return {k: _apply_aux_masked(v, masked) for k, v in obj.items()}
+        return {(masked[k] if k in masked else k): _apply_aux_masked(v, masked)
+                for k, v in obj.items()}
     if isinstance(obj, list):
         return [_apply_aux_masked(v, masked) for v in obj]
     return obj
@@ -274,12 +311,34 @@ class GatewayService:
             if upstream.route in ("INTERNET", "GOVCLOUD") and upstream.route not in self._upstream_for:
                 self._upstream_for[upstream.route] = upstream.name
 
+    # ── 会话属主（审查加固：跨部门还原链封死）─────────────────────
+    def _bind_session(self, session_id: str, dept: str) -> None:
+        """把会话绑定到首次使用的部门（先到先得）；已被他部门绑定 → SessionOwnerError。
+
+        占位符映射本身无部门归属（主键 ``(session_id, placeholder)``），不绑属主
+        时任一部门 Key 可借他部门 session_id 经还原面把占位符还原成原值。绑定面
+        为 :meth:`masking.session_store.SessionStore.bind_session`（持久）或
+        :meth:`masking.mapper.SessionRegistry.bind_session`（进程内）；注入的自定义
+        registry 无此面时跳过（eval 直构形态，无跨部门面）。
+        """
+        binder = getattr(self.registry, "bind_session", None)
+        if not callable(binder):
+            return
+        owner = binder(session_id, dept)
+        if owner != dept:
+            raise SessionOwnerError(session_id)
+
     # ── 主入口：非流式 ────────────────────────────────────────────
     async def handle_chat(
         self, body: Any, *, dept: str, session_id: str, request_id: str
     ) -> GatewayResult:
         started = time.perf_counter()
+        # 先校验后绑定（审查残余销项）：被 400 拒绝的畸形请求不得留下会话属主
+        # 绑定——否则持有效部门 Key 者可用垃圾请求按先到先得抢占任意 session_id，
+        # 且 registry._owners 留下无 mapper 条目（无清理路径）；与
+        # /internal/anonymize 的「校验后绑定」同一口径。
         self._validate_body(body)
+        self._bind_session(session_id, dept)
         prep = self._prepare(body, session_id=session_id, request_id=request_id)
         decision = prep.decision
         headers = prep.headers
@@ -336,8 +395,9 @@ class GatewayService:
         self._restore_choices(data, prep.mapper)
 
         # 7) 输出侧复检钩子（§6 M5 moderate(response)；P0 空后端恒 safe 零影响）：
-        #    flagged → 按 content_blocked 拦截本次响应（上游已消费，审计如实记 flag）
-        flagged = self._moderate_response(data)
+        #    flagged → 按 content_blocked 拦截本次响应（上游已消费，审计如实记 flag）；
+        #    redact=脱敏承接（审查加固：复检后端若外发，先换占位符，见 _output_redact）
+        flagged = self._moderate_response(data, redact=self._output_redact(session_id))
         if flagged is not None:
             return finish(403, flagged, upstream_name=upstream.name,
                           response_preview=response_preview, flags=[FLAG_OUTPUT_FLAGGED])
@@ -355,7 +415,9 @@ class GatewayService:
         self, body: Any, *, dept: str, session_id: str, request_id: str
     ) -> GatewayStreamResult:
         started = time.perf_counter()
+        # 先校验后绑定（与 handle_chat 同口径，见彼处注释）
         self._validate_body(body)
+        self._bind_session(session_id, dept)
         prep = self._prepare(body, session_id=session_id, request_id=request_id)
         decision = prep.decision
         headers = prep.headers
@@ -426,20 +488,33 @@ class GatewayService:
         if ai_label:
             headers = {**headers, HEADER_AI_LABEL: "1"}
         preview_parts: list[str] = []
+        restored_parts: list[str] = []
         composed = sse.compose_chat_stream(
             stream.aiter(), mapper=prep.mapper, ai_label=ai_label,
             on_content=preview_parts.append,
+            on_restored=restored_parts.append,
         )
 
         async def guarded() -> AsyncIterator[str]:
             """组合管线 + 连接释放 + 中途断流 SSE 错误事件 + 流收尾审计。"""
-            interrupted = False
+            interrupted: str | None = None   # None | "upstream" | "tool_overflow"
             try:
                 try:
                     async for text in composed:
                         yield text
+                except ToolArgumentsOverflowError as exc:
+                    # 溢出属开流后失败：按模块 docstring 口径以 SSE 错误事件收尾
+                    # （200 已发出、500 无法回传）；缓冲占位符参数整体丢弃不泄漏
+                    interrupted = "tool_overflow"
+                    log.error("chat_stream.tool_arguments_overflow", extra={
+                        "request_id": request_id,
+                    })
+                    yield sse.format_sse(json.dumps({
+                        "error": {"message": str(exc), "type": "tool_arguments_overflow",
+                                  "param": None, "code": None},
+                    }, ensure_ascii=False))
                 except (httpx.HTTPError, UpstreamUnavailableError) as exc:
-                    interrupted = True
+                    interrupted = "upstream"
                     log.error("chat_stream.upstream_interrupted", extra={
                         "request_id": request_id, "exc_type": type(exc).__name__,
                     })
@@ -450,6 +525,29 @@ class GatewayService:
                 finally:
                     await stream.aclose()
             finally:
+                # 输出侧复检钩子（§6 M5，流式补齐）：收尾对**还原后**全文复检
+                # （与非流式同一对象口径）。流式已逐 delta 放行、无法追回，故
+                # flagged = 响亮记日志 + 审计 flag 留痕（检测+留痕语义，见模块
+                # docstring「范围与取舍」）；P0 NullModerator 恒 safe 零影响。
+                stream_flags: list[str] = (
+                    ["upstream_stream_interrupted"] if interrupted == "upstream"
+                    else ["tool_arguments_overflow"] if interrupted == "tool_overflow"
+                    else [])
+                restored_text = "".join(restored_parts)
+                if not interrupted and restored_text:
+                    try:
+                        verdict = self.outguard.moderate(
+                            restored_text, redact=self._output_redact(session_id))
+                    except Exception as exc:  # noqa: BLE001 — 复检故障不断流（记日志降级）
+                        log.error("chat_stream.moderate_failed",
+                                  extra={"exc_type": type(exc).__name__})
+                    else:
+                        if verdict.verdict == "flagged":
+                            log.error("chat_stream.output_flagged", extra={
+                                "request_id": request_id,
+                                "categories": "、".join(verdict.categories),
+                            })
+                            stream_flags.append(FLAG_OUTPUT_FLAGGED)
                 # 流式审计：response_preview=占位符版本经检测+脱敏（同非流式口径，
                 # 见 _safe_response_preview）；硬闸失败=不落库
                 try:
@@ -461,7 +559,7 @@ class GatewayService:
                             "".join(preview_parts), session_id),
                         upstream_name=upstream.name,
                         latency_ms=int((time.perf_counter() - started) * 1000),
-                        flags=(["upstream_stream_interrupted"] if interrupted else []),
+                        flags=stream_flags,
                         normalized_values=sorted(prep.used_values | prep.used_surfaces),
                     )
                 except RawPiiLeakError as exc:
@@ -603,12 +701,20 @@ class GatewayService:
         """上游请求体：剥离 messages/stream 重建（模型缺省取该上游清单首项）。
 
         ``tools`` 等顶层字段经 :func:`_apply_aux_masked` 重建（深拷贝，不改写
-        请求体原对象）——其字符串叶已在 :meth:`_prepare` 过检测面并拿到脱敏版。
+        请求体原对象）——其字符串叶已在 :meth:`_prepare` 过检测面并拿到脱敏版；
+        顶层**标量字符串**（``user``、``stop`` 等）同样按映射替换（审查加固：
+        ``messages``/``stream`` 之外无原样透传面，未检出的字符串原样保留）。
         """
-        out_payload = {
-            k: (_apply_aux_masked(v, prep.aux_masked) if isinstance(v, (dict, list)) else v)
-            for k, v in body.items() if k not in ("messages", "stream")
-        }
+        out_payload: dict[str, Any] = {}
+        for k, v in body.items():
+            if k in ("messages", "stream"):
+                continue
+            if isinstance(v, str):
+                out_payload[k] = prep.aux_masked.get(v, v)
+            elif isinstance(v, (dict, list)):
+                out_payload[k] = _apply_aux_masked(v, prep.aux_masked)
+            else:
+                out_payload[k] = v
         out_payload["model"] = str(body.get("model")
                                    or (upstream.models[0] if upstream.models else "default"))
         out_payload["messages"] = [
@@ -622,33 +728,38 @@ class GatewayService:
     @staticmethod
     def _masked_message(message: dict[str, Any], masked_contents: dict[tuple[int, int], str],
                         aux_masked: dict[str, str], msg_index: int) -> dict[str, Any]:
-        """用脱敏文本重建消息：str 整体替换；list 原位替换文本段。
-
-        非 text 多模态段、历史 ``tool_calls`` / ``function_call`` 的字符串叶
-        （arguments/name 等）经 ``aux_masked`` 映射替换——这些位置不再原样透传
-        （审查 §A1/A4：出站全量检测面）。
+        """用脱敏文本重建消息：content 逐段替换；**其余字段**（``name`` 等自定义
+        字段、``tool_calls`` / ``function_call``）的字符串值与嵌套结构（含 dict
+        键）经 ``aux_masked`` 映射替换——消息级不再有原样透传面（审查 §A1/A4
+        及其消息级残余的销项）。键序按原消息保持。
         """
-        out = {**message}
-        content = message.get("content")
-        if isinstance(content, str):
-            out["content"] = masked_contents.get((msg_index, -1), content)
-        elif isinstance(content, list):
-            pieces: list[Any] = []
-            for piece_index, piece in enumerate(content):
-                if isinstance(piece, str):
-                    pieces.append(masked_contents.get((msg_index, piece_index), piece))
-                elif isinstance(piece, dict) and piece.get("type") == "text":
-                    text = str(piece.get("text", ""))
-                    pieces.append({**piece, "text": masked_contents.get((msg_index, piece_index), text)})
-                elif isinstance(piece, (dict, list)):
-                    pieces.append(_apply_aux_masked(piece, aux_masked))
+        out: dict[str, Any] = {}
+        for key, value in message.items():
+            if key == "content":
+                if isinstance(value, str):
+                    out["content"] = masked_contents.get((msg_index, -1), value)
+                elif isinstance(value, list):
+                    pieces: list[Any] = []
+                    for piece_index, piece in enumerate(value):
+                        if isinstance(piece, str):
+                            pieces.append(masked_contents.get((msg_index, piece_index), piece))
+                        elif isinstance(piece, dict) and piece.get("type") == "text":
+                            text = str(piece.get("text", ""))
+                            pieces.append({**piece, "text": masked_contents.get((msg_index, piece_index), text)})
+                        elif isinstance(piece, (dict, list)):
+                            pieces.append(_apply_aux_masked(piece, aux_masked))
+                        else:
+                            pieces.append(piece)
+                    out["content"] = pieces
                 else:
-                    pieces.append(piece)
-            out["content"] = pieces
-        if isinstance(out.get("tool_calls"), list):
-            out["tool_calls"] = [_apply_aux_masked(call, aux_masked) for call in out["tool_calls"]]
-        if isinstance(out.get("function_call"), (dict, list)):
-            out["function_call"] = _apply_aux_masked(out["function_call"], aux_masked)
+                    out["content"] = value
+                continue
+            if isinstance(value, str):
+                out[key] = aux_masked.get(value, value)
+            elif isinstance(value, (dict, list)):
+                out[key] = _apply_aux_masked(value, aux_masked)
+            else:
+                out[key] = value
         return out
 
     @staticmethod
@@ -715,7 +826,7 @@ class GatewayService:
 
     @staticmethod
     def _restore_choices(data: dict[str, Any], mapper: Any) -> None:
-        """原地还原响应中的占位符：choices[*].message.content 与 tool_calls 参数。"""
+        """原地还原响应中的占位符：choices[*].message.content 与 tool_calls/function_call 参数。"""
         choices = data.get("choices")
         if not isinstance(choices, list):
             return
@@ -736,20 +847,44 @@ class GatewayService:
                     if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
                         # 非流式直接整体还原（§6 M3 工具条目；实现归 masking.toolbuf）
                         fn["arguments"] = restore_arguments(mapper, fn["arguments"])
+            fn_call = message.get("function_call")
+            if isinstance(fn_call, dict) and isinstance(fn_call.get("arguments"), str):
+                # legacy function_call 同口径整体还原（与流式 hold-to-finish 一致）
+                fn_call["arguments"] = restore_arguments(mapper, fn_call["arguments"])
 
     # ── 输出侧（T2.2 outguard）：复检钩子 + AI 标识 ──────────────
-    def _moderate_response(self, data: dict[str, Any]) -> dict[str, Any] | None:
+    def _output_redact(self, session_id: str) -> RedactFn:
+        """输出复检协议 ``redact`` 参数的取值（审查加固：脱敏承接）。
+
+        单参 ``str -> str`` 纯函数：与 :meth:`_safe_response_preview` 同一
+        检测+脱敏口径（规则层命中 → 会话稳定占位符；密级/注入表面形式 →
+        拦截占位）。复检后端若把文本发往外部端点（P1 语义审核模型），必须先经
+        它换占位符——原文不在复检判定前出网（与输入侧
+        ``SemanticAdapter._redact_for_judge`` 同口径）。P0 NullModerator 从不
+        调用之，行为零变化。
+        """
+        def redact(text: str) -> str:
+            return self._safe_response_preview(text, session_id)
+        return redact
+
+    def _moderate_response(self, data: dict[str, Any],
+                           *, redact: RedactFn | None = None) -> dict[str, Any] | None:
         """输出侧复检钩子（§6 M5 moderate(response)）：flagged → content_blocked 信封。
 
         复检对象：还原后的首 choice 正文（P0 空后端恒 safe；P1 语义审核模型
         采样执行，注入 OutguardService.moderator 即生效，此处接线不再变更）。
-        ``flagged`` → 403 信封 reasons code=OUTPUT_MODERATION（detail 带风险类目），
-        message 取文案库 OUTPUT_MODERATION 模板；无正文（纯工具调用响应）不复检。
+        ``redact`` 经 :meth:`outguard.service.OutguardService.moderate` 透传
+        （见 :meth:`_output_redact`）。``flagged`` → 403 信封 reasons code=
+        OUTPUT_MODERATION（detail 带风险类目），message 取文案库
+        OUTPUT_MODERATION 模板；无正文（纯工具调用响应）不复检。
         """
         content = self._first_choice_content(data)
         if not content:
             return None
-        verdict: ModerationVerdict = self.outguard.moderate(content)
+        if redact is not None:
+            verdict: ModerationVerdict = self.outguard.moderate(content, redact=redact)
+        else:
+            verdict = self.outguard.moderate(content)
         if verdict.verdict != "flagged":
             return None
         detail = "输出侧复检命中：" + ("、".join(verdict.categories)

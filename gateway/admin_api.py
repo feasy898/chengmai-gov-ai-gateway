@@ -19,9 +19,14 @@
 - ``limit`` / ``offset``：分页（缺省 limit=AUDIT_PAGE_LIMIT_DEFAULT、上限
   AUDIT_PAGE_LIMIT_MAX，offset 缺省 0）；非整数 / 越界 → 400 ``bad_request``。
 
-鉴权（全部管理面端点，与 /internal/* 同一硬口径）：任意一个有效部门 Key
-（``Authorization: Bearer <dept_key>``）放行——管理面语义=看板/自查/管理用途的
-只读脱敏视图；缺 key / 错 key → 401 ``unauthorized``。生产部署另须仅经本地
+鉴权（全部管理面端点）：缺省与 /internal/* 同一硬口径——任意一个有效部门 Key
+（``Authorization: Bearer <dept_key>``）放行，管理面语义=看板/自查/管理用途的
+只读脱敏视图；缺 key / 错 key → 401 ``unauthorized``。
+**admin key 硬闸旋钮（审查加固）**：部署方配置 admin key（env 名取
+``cfg.admin_key_env``，缺省 ``ANONGW_ADMIN_KEY``）后，本面三条端点（含
+/webui 挂载的 /admin/api/demo/*）只认该 key——部门 Key 不再放行管理面，
+「任一部门 Key 横向读全部审计元数据 / seed/clear 演示态」的口子收敛；
+key 库存 sha256、常量时间比较，明文只经环境变量注入。生产部署另须仅经本地
 管理面/内网访问（与 /internal/* 同一安全注记，见 gateway/app.py 模块文档）。
 
 只读：三条端点只经 audit/query.py 的只读连接读 audit_events（脱敏预览，
@@ -29,6 +34,7 @@
 """
 from __future__ import annotations
 
+import hmac
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -76,11 +82,14 @@ def _audit_db_path(app: FastAPI) -> Path:
 
 
 def _authenticate(app: FastAPI, request: Request) -> str | None:
-    """部门 Key 鉴权（常量时间比较，与 /v1/chat/completions 同一实现）；未命中 None。"""
-    return deps.authenticate(
-        deps.extract_bearer(request.headers.get("authorization")),
-        app.state.dept_key_digests,
-    )
+    """管理面鉴权：配置了 admin key 时只认它；否则回落部门 Key（常量时间比较）。"""
+    presented = deps.extract_bearer(request.headers.get("authorization"))
+    admin_digest = getattr(app.state, "admin_key_digest", None)
+    if admin_digest:
+        if presented and hmac.compare_digest(deps.sha256_hex(presented), admin_digest):
+            return "__admin__"
+        return None
+    return deps.authenticate(presented, app.state.dept_key_digests)
 
 
 def _parse_common_filters(query: Any) -> EventFilter:

@@ -14,6 +14,11 @@ log = get_logger(__name__)
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows 编码纪律（与 ops.e2e_smoke / evals.gate_d0 同口径）：GBK 控制台
+    # 重定向下中文 JSON 日志不得触发 logging 编码告警——入口先重配 UTF-8。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(
         prog="gateway",
         description="政务 AI 安全网关（OpenAI 兼容 /v1/chat/completions 代理）",

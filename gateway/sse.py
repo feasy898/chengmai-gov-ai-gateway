@@ -28,7 +28,12 @@ from common.logs import get_logger
 from evals.thresholds import GATEWAY_SSE_LINE_MAX_BYTES
 from masking.mapper import SessionMapper
 from masking.remap import StreamRestorer
-from masking.toolbuf import ToolCallBuffer
+from masking.toolbuf import (
+    MAX_ARGUMENTS_CHARS,
+    ToolArgumentsOverflowError,
+    ToolCallBuffer,
+    restore_arguments,
+)
 
 # AI 标识的常量/辅助函数自 T2.2 起归属 outguard 包（outguard/label.py 权威实现）；
 # 此处再导出保持既有引用（evals.t0_stream 等）不变。
@@ -147,21 +152,35 @@ async def compose_chat_stream(
     mapper: SessionMapper,
     ai_label: str | None,
     on_content: Callable[[str], None] | None = None,
+    on_restored: Callable[[str], None] | None = None,
 ) -> AsyncIterator[str]:
     """主组合管线：上游字节流 → 网关 SSE 文本流（还原 + 工具 hold + AI 标识）。
 
     - 内容增量：过 :class:`StreamRestorer` 后放行；``on_content`` 在还原**前**
-      收到上游原始内容（审计 response_preview 取占位符版本用）；
-    - 工具增量：全部缓冲，finish 时整体还原为单个 delta；
+      收到上游原始内容（审计 response_preview 取占位符版本用）；``on_restored``
+      在还原**后**收到将放行的内容增量（输出侧复检取还原版全文用）；收尾
+      flush 残片（未闭合占位符候选，原样放行）同口径过两回调；
+    - 多 choice（n>1）按 ``choice.index`` 分槽还原（审查加固）：各 choice 的
+      content 增量互不串槽，跨 choice 交错时占位符还原不再互相污染；
+    - 工具增量：全部缓冲（``tool_calls`` 与 legacy ``function_call`` 同口径，
+      审查加固：legacy 增量不再原样透传），finish 时整体还原为单个 delta；
     - finish chunk：**先 feed 本块**（正文尾片/参数尾片先进状态机与缓冲），再补发
       还原尾（restorer flush）、工具 delta、AI 标识内容 delta，最后给 finish chunk
       的首个 choice delta 加 ``annotations`` 元数据后放行；
     - 若上游未发 finish chunk 就 ``[DONE]``，在 [DONE] 前执行同一收尾序列；
     - 非法 JSON / 非 dict 载荷：原样透传（网关不吞不猜）。
     """
-    restorer = StreamRestorer(mapper.lookup)
+    restorers: dict[int, StreamRestorer] = {}
     tools = StreamToolBuffer()
+    fn_state: dict[str, list[str]] = {"name": [], "args": []}   # legacy function_call 槽
     state = {"finished": False, "content_seen": False, "stop_seen": False}
+
+    def restorer_for(index: int) -> StreamRestorer:
+        restorer = restorers.get(index)
+        if restorer is None:
+            restorer = StreamRestorer(mapper.lookup)
+            restorers[index] = restorer
+        return restorer
 
     def finish_reason_of(event: dict) -> str | None:
         choices = event.get("choices")
@@ -173,16 +192,34 @@ async def compose_chat_stream(
         return None
 
     def finalize(reason: str | None) -> list[str]:
-        """收尾序列（幂等）：还原尾 → 工具整发 → AI 标识尾注。"""
+        """收尾序列（幂等）：还原尾（按 choice 分槽）→ 工具整发 → AI 标识尾注。"""
         if state["finished"]:
             return []
         state["finished"] = True
         out: list[str] = []
-        tail = restorer.flush()
-        if tail:
+        for index in sorted(restorers):
+            tail = restorers[index].flush()
+            if tail:
+                # 尾片同样进 on_content（审计预览=还原前占位符版本）与 on_restored
+                # （输出侧复检=实际放行面）——审查残余销项：流收尾残片（未闭合
+                # 占位符候选，原样放行）不得绕过审计预览与复检
+                if on_content is not None:
+                    on_content(tail)
+                if on_restored is not None:
+                    on_restored(tail)
+                out.append(format_sse(json.dumps(
+                    {"choices": [{"index": index, "delta": {"content": tail},
+                                  "finish_reason": None}]},
+                    ensure_ascii=False)))
+        if fn_state["args"]:
+            arguments = restore_arguments(mapper, "".join(fn_state["args"]))
             out.append(format_sse(json.dumps(
-                {"choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}]},
+                {"choices": [{"index": 0,
+                              "delta": {"function_call": {"name": "".join(fn_state["name"]),
+                                                          "arguments": arguments}},
+                              "finish_reason": None}]},
                 ensure_ascii=False)))
+            fn_state["name"], fn_state["args"] = [], []
         for call in tools.finalize(mapper):
             out.append(format_sse(json.dumps(
                 {"choices": [{"index": 0, "delta": {"tool_calls": [call]}, "finish_reason": None}]},
@@ -205,16 +242,35 @@ async def compose_chat_stream(
             delta = choice.get("delta")
             if not isinstance(delta, dict):
                 continue
+            index = choice.get("index")
+            slot = index if isinstance(index, int) else 0
             content = delta.get("content")
             if isinstance(content, str) and content:
                 if on_content is not None:
                     on_content(content)
                 state["content_seen"] = True
-                delta["content"] = restorer.feed(content)
+                restored = restorer_for(slot).feed(content)
+                if on_restored is not None and restored:
+                    on_restored(restored)
+                delta["content"] = restored
             tool_calls = delta.get("tool_calls")
             if isinstance(tool_calls, list) and tool_calls:
                 tools.feed(tool_calls)
                 del delta["tool_calls"]
+            fn_call = delta.get("function_call")
+            if isinstance(fn_call, dict):
+                # legacy 增量同 tool_calls 口径 hold-to-finish（finish 前不发）
+                if isinstance(fn_call.get("name"), str) and fn_call["name"]:
+                    if not fn_state["name"]:
+                        fn_state["name"].append(fn_call["name"])
+                fragment = fn_call.get("arguments")
+                if isinstance(fragment, str) and fragment:
+                    fn_state["args"].append(fragment)
+                    if sum(len(a) for a in fn_state["args"]) > MAX_ARGUMENTS_CHARS:
+                        raise ToolArgumentsOverflowError(
+                            f"legacy function_call arguments exceeded "
+                            f"{MAX_ARGUMENTS_CHARS} chars")
+                del delta["function_call"]
             if reason is not None and choice.get("finish_reason") is not None:
                 if ai_label and ANNOTATIONS_FIELD not in delta:
                     delta[ANNOTATIONS_FIELD] = ai_annotations(ai_label)

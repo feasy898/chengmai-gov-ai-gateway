@@ -25,8 +25,14 @@
 /internal/* 调试端点（审查 §A1）：复用与 /v1/chat/completions 同一部门 Key 鉴权
 （Authorization: Bearer <dept_key>），未命中 → 401——响应含 Finding.raw/还原原文，
 绝不无鉴权暴露；生产部署另须仅经本地管理面/内网访问（见 README 安全注记）。
-/admin/api/* 管理面查询端点（T5.1）：同为部门 Key 鉴权，只读审计库（脱敏预览），
-形状与鉴权口径见 gateway/admin_api.py 模块文档。
+会话与部门绑定（审查加固）：会话首次使用即归属到该部门（/v1/chat 与
+/internal/anonymize 先到先得；/internal/restore 只认属主部门，他部门 403）——
+占位符映射虽在 masking_map 存归一化原值，借他部门 session_id 的还原链就此封死；
+客户端自带的 x-anongw-session-id 过形态闸（``[A-Za-z0-9._-]{1,128}``）。
+/admin/api/* 管理面查询端点（T5.1）：部门 Key 鉴权，只读审计库（脱敏预览），
+形状与鉴权口径见 gateway/admin_api.py 模块文档；配置 admin key
+（env 名 ``cfg.admin_key_env``，缺省 ``ANONGW_ADMIN_KEY``）后只认该 key——
+部门 Key 不再放行管理面（审查加固：横向读审计/切演示态面收敛）。
 
 落库形态（T1.3）：不注入时审计走 SQLite 写队列（cfg.audit_db）、会话映射走
 SessionStore（cfg.session_db，TTL=cfg.session_ttl_h，lifespan 挂清理协程）——
@@ -44,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -81,6 +88,7 @@ from gateway.pipeline import (
     CODE_UNAUTHORIZED,
     ChatBodyError,
     GatewayService,
+    SessionOwnerError,
 )
 from masking.session_store import SessionStore
 from recognizers.pipeline import detect_full
@@ -89,6 +97,11 @@ log = get_logger(__name__)
 
 #: 会话 TTL 清理协程的运行间隔（秒）
 CLEANUP_INTERVAL_S = 300.0
+
+#: 客户端自带 session id 的形态闸（审查加固：请求头/请求体里的 ``x-anongw-session-id``
+#: 直接作会话存储键，须限字符集与长度——防控制字符注入响应头/审计，且令
+#: masking_map 行数有界可清；网关自生成的 ``sess_`` 形态天然通过）。
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 #: 文件通道错误码（§5.6 错误信封复用面；413/400/422 映射见 filechannel/errors.py 口径）
 CODE_UNSUPPORTED_FILE = "unsupported_file_type"
@@ -245,6 +258,12 @@ def create_app(
     app.state.service = service
     app.state.cfg = cfg
     app.state.dept_key_digests = digests
+    # 管理面硬闸旋钮（审查加固）：配置了 admin key（env 名取 cfg.admin_key_env，
+    # 值不入任何文件）时 /admin/api/* 只认该 key，部门 Key 不再放行管理面——
+    # 封死「任一部门 Key 读全部审计元数据/切演示态」的横向面；未配置保持
+    # T5.1 演示口径（任意有效部门 Key 放行）。库存哈希，常量时间比较。
+    admin_key = resolve_secret(cfg.admin_key_env, required=False)
+    app.state.admin_key_digest = deps.sha256_hex(admin_key) if admin_key else None
     app.state.audit = audit
     app.state.session_registry = registry
     app.state.file_service = files
@@ -361,8 +380,13 @@ def create_app(
         if not isinstance(body, dict):
             return _error_response(400, CODE_BAD_REQUEST, "request body must be a JSON object")
 
-        # 4) 标识：session 可由客户端携带（多轮稳定脱敏），request 每请求新生成
-        session_id = request.headers.get("x-anongw-session-id") or deps.new_session_id()
+        # 4) 标识：session 可由客户端携带（多轮稳定脱敏），request 每请求新生成；
+        #    客户端自带值过形态闸（限字符集/长度，防头注入与无界键喷洒）
+        client_session = request.headers.get("x-anongw-session-id")
+        if client_session is not None and not SESSION_ID_RE.fullmatch(client_session):
+            return _error_response(400, CODE_BAD_REQUEST,
+                                   "x-anongw-session-id must match [A-Za-z0-9._-]{1,128}")
+        session_id = client_session or deps.new_session_id()
         request_id = deps.new_request_id()
 
         # 5) 主链路（流式 / 非流式分流；校验与错误信封两形态一致）
@@ -391,6 +415,13 @@ def create_app(
                                                request_id=request_id)
         except ChatBodyError as exc:
             return _error_response(400, CODE_BAD_REQUEST, str(exc))
+        except SessionOwnerError as exc:
+            # 会话已被其他部门绑定（审查加固：跨部门还原/回显链封死）
+            log.warning("chat.session_owner_mismatch", extra={
+                "request_id": request_id, "dept": dept,
+            })
+            return _error_response(403, CODE_UNAUTHORIZED,
+                                   "session_id 不属于当前部门（会话与部门绑定，跨部门复用被拒绝）")
         except RawPiiLeakError as exc:
             log.error("audit.raw_pii_gate.tripped", extra={"request_id": request_id, "kind": exc.kind})
             return _error_response(500, CODE_INTERNAL_ERROR, "审计零明文断言失败，事件未落库")
@@ -425,9 +456,10 @@ def create_app(
 
     @app.post("/internal/anonymize")
     async def internal_anonymize(request: Request) -> JSONResponse:
-        if deps.authenticate(
+        dept = deps.authenticate(
             deps.extract_bearer(request.headers.get("authorization")), digests,
-        ) is None:
+        )
+        if dept is None:
             return _error_response(401, CODE_UNAUTHORIZED, "无效部门 Key（Authorization: Bearer dk_***）")
         body, err = await _read_json_body(request)
         if err is not None:
@@ -439,6 +471,16 @@ def create_app(
         session_id = body.get("session_id")
         if not isinstance(session_id, str) or not session_id:
             session_id = deps.new_session_id()
+        elif not SESSION_ID_RE.fullmatch(session_id):
+            return _error_response(400, CODE_BAD_REQUEST,
+                                   "session_id must match [A-Za-z0-9._-]{1,128}")
+        # 会话属主绑定（审查加固）：首次使用即绑定到本部门；他部门已绑定的会话拒绝，
+        # 堵住「占位符 → 他部门会话还原原值」的横向链
+        try:
+            service._bind_session(session_id, dept)
+        except SessionOwnerError:
+            return _error_response(403, CODE_UNAUTHORIZED,
+                                   "session_id 不属于当前部门（会话与部门绑定，跨部门复用被拒绝）")
         text = body["text"]
         spans = [
             (f.start, f.end, f.type, f.normalized)
@@ -455,9 +497,10 @@ def create_app(
 
     @app.post("/internal/restore")
     async def internal_restore(request: Request) -> JSONResponse:
-        if deps.authenticate(
+        dept = deps.authenticate(
             deps.extract_bearer(request.headers.get("authorization")), digests,
-        ) is None:
+        )
+        if dept is None:
             return _error_response(401, CODE_UNAUTHORIZED, "无效部门 Key（Authorization: Bearer dk_***）")
         body, err = await _read_json_body(request)
         if err is not None:
@@ -469,6 +512,17 @@ def create_app(
         session_id = body.get("session_id")
         if not isinstance(session_id, str) or not session_id:
             session_id = deps.new_session_id()
+        elif not SESSION_ID_RE.fullmatch(session_id):
+            return _error_response(400, CODE_BAD_REQUEST,
+                                   "session_id must match [A-Za-z0-9._-]{1,128}")
+        # 会话属主闸（审查加固）：还原面只认属主部门（admin/api 审计预览里携带的
+        # session_id 拿到别部门 Key 手里也无法再还原原值）；未绑定会话无映射可还原
+        owner_of = getattr(service.registry, "owner_of", None)
+        if callable(owner_of):
+            owner = owner_of(session_id)
+            if owner is not None and owner != dept:
+                return _error_response(403, CODE_UNAUTHORIZED,
+                                       "session_id 不属于当前部门（会话与部门绑定，跨部门还原被拒绝）")
         mapper = service.registry.get(session_id)
         return JSONResponse({"session_id": session_id, "restored": mapper.restore(body["text"])})
 
