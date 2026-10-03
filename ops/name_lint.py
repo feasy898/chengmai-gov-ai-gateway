@@ -15,7 +15,8 @@
 范围与豁免（审查 §E 收窄后）：
 - 默认扫描后缀：.py .md .txt .html .js .ts .css .sh .bat .ps1（源码/注释/文档）；
 - 严格档额外扫 .yaml .yml .toml .json .cfg .ini（用于公开导出前的终检）；
-- 排除目录：.git .venv venv plan third_party data node_modules __pycache__ .zcode（本地工具状态）等；
+- 排除目录：.git .venv venv plan third_party data node_modules __pycache__ .zcode（本地工具状态）、
+  out/tmp/evidence（本地工件：构建输出/工作流日志/门禁运行留档）等；
 - 豁免面收窄为「仓库根固定坐标」：pyproject.toml、constraints.txt、
   ops/clone_oss.sh（内部克隆坐标）、ops/forbidden_names.txt（词表自身）——
   仅这些**根级路径**豁免，其它目录里的同名文件一律照扫（防豁免面被借道）；
@@ -44,6 +45,8 @@ EXCLUDED_DIRS = {
     ".git", ".venv", "venv", "plan", "third_party", "data", "node_modules",
     "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache", "dist", "build", "out", "tmp",
     ".zcode",  # 本地工作流工具状态（自持 .gitignore，非仓库源码，T1.4）
+    "evidence",  # 门禁运行留档（未跟踪的本地工件，逐字引用 eval 原始日志——
+                 # 日志里天然含第三方引擎名；与 tmp/out 同类的非源码目录）
 }
 #: 根级坐标豁免（相对仓库根的固定路径；别处同名文件照扫——审查 §E 收窄）
 ROOT_SCOPED_EXEMPT = frozenset({

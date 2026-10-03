@@ -72,6 +72,7 @@
 from __future__ import annotations
 
 import csv
+import functools
 import hashlib
 import http.client
 import io
@@ -82,6 +83,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -114,6 +116,7 @@ from common.config import (  # noqa: E402
     load_env_file,
     resolve_secret,
 )
+from evals.thresholds import U8_CONTENT_FILTER_RETRIES, U8_EMPTY_REPLY_RETRIES  # noqa: E402
 from filechannel.parsers import parse_any  # noqa: E402
 from gateway.app import create_app, resolve_db_path  # noqa: E402
 from gateway.mock_upstream import ECHO_MARKER  # noqa: E402
@@ -136,10 +139,17 @@ DEMO_KEY = "dk_5e6f7a8b"        # 演示明文；config/dept_keys.yaml 只存其
 
 AI_LABEL = "本内容由AI生成"      # config/app.yaml ai_label
 
-READY_TIMEOUT_S = 60.0          # mock/网关子进程冷启动就绪等待（T8.3 收官批 20→60：
-                                # 共享机 AV/索引峰值下 python+uvicorn 冷启动可 >20s——
-                                # 就绪等待≠性能断言，性能预算在 thresholds 另有常量）
+READY_TIMEOUT_S = 240.0         # mock/网关子进程冷启动就绪等待（T8.3 收官批 20→60；
+                                # 本机 AV/索引峰值实测 python+httpx+uvicorn 冷启动
+                                # 121s——2026-10-02 复测后 60→240，与 m11 回环 240s 口径
+                                # 一致。就绪等待≠性能断言，性能预算在 thresholds 另有常量）
 AUDIT_SETTLE_TIMEOUT_S = 10.0
+# 回环 admin 探针超时（健壮性护栏非性能断言，与主客户端 120s 同口径）：T8.3 run4
+# 实锤共享机负载峰值下回环新建连接可 >30s——2026-10-03 gate_final b3 一轮再实锤：
+# U1 起手 mock admin 探针（当时 5s 超时）ConnectTimeout → U1 假失败 + U5 级联
+# KeyError。mock / GPU-service 的 admin 探针统一放宽到此值；正常情形毫秒级返回，
+# 仅病态悬挂时兜底，功能断言不受超时值影响
+LOOPBACK_ADMIN_TIMEOUT_S = 120.0
 U2_REPLAYS = 20                 # §9 U2：流式重放次数
 
 # ── U8 真实大模型全链（批次6 T6.2）────────────────────────────────────
@@ -148,7 +158,10 @@ U2_REPLAYS = 20                 # §9 U2：流式重放次数
 REAL_PROFILE_INTERNET = "internet_real"
 REAL_PROFILE_GOVCLOUD = "govcloud_real"
 U8_GATEWAY_PORT = 9010          # 真实链路独立网关实例（:9000 留给 mock 链用例）
-U8_MAX_TOKENS = 192             # 单腿生成长度上限（真实推理延迟护栏，随请求体下发）
+U8_MAX_TOKENS = 1024            # 单腿生成长度上限（真实推理延迟护栏，随请求体下发；
+                                # 2026-10-03 192→1024：真实上游换为思考型云端模型后，
+                                # 思考段即耗尽 192 导致正文为空（实测 reasoning~191/192），
+                                # 本值只放宽请求预算，回空/泄漏断言不变）
 U8_HEALTH_TIMEOUT_S = 5.0       # 真实上游 /health 探测超时
 U8_CLIENT_TIMEOUT_S = 180.0     # U8 客户端总超时（真实推理 + 网关链路）
 U8_SESSION_INTERNET = "sess_e2e_u8a"
@@ -463,15 +476,18 @@ def _start_mock(port: int) -> subprocess.Popen:
 
 
 def _mock_count(base: str) -> int:
-    return int(httpx.get(f"{base}/admin/records", timeout=5.0).json()["count"])
+    return int(httpx.get(f"{base}/admin/records",
+                         timeout=LOOPBACK_ADMIN_TIMEOUT_S).json()["count"])
 
 
 def _mock_text(base: str) -> bytes:
-    return httpx.get(f"{base}/admin/text", timeout=5.0).content
+    return httpx.get(f"{base}/admin/text",
+                     timeout=LOOPBACK_ADMIN_TIMEOUT_S).content
 
 
 def _mock_last_record(base: str) -> dict[str, Any]:
-    records = httpx.get(f"{base}/admin/records", timeout=5.0).json()["records"]
+    records = httpx.get(f"{base}/admin/records",
+                        timeout=LOOPBACK_ADMIN_TIMEOUT_S).json()["records"]
     if not records:
         raise AssertionError(f"{base} ring buffer 为空")
     return records[-1]
@@ -906,7 +922,8 @@ def case_u5(ctx: dict[str, Any]) -> str:
     _assert_no_raw(blob, RAW_VALUES, "audit events json")
     # 管理面查询 API（T5.1 起在位）：带部门 Key 交叉核对行数与聚合；无 Key → 401 负例
     auth = {"Authorization": f"Bearer {DEMO_KEY}"}
-    resp = ctx["client"].get("/admin/api/audit", headers=auth, timeout=5.0)
+    resp = ctx["client"].get("/admin/api/audit", headers=auth,
+                             timeout=LOOPBACK_ADMIN_TIMEOUT_S)
     if resp.status_code != 200:
         raise AssertionError(f"/admin/api/audit status={resp.status_code} {resp.text[:200]!r}")
     page = resp.json()
@@ -915,10 +932,11 @@ def case_u5(ctx: dict[str, Any]) -> str:
         raise AssertionError(f"/admin/api/audit rows={n} != {expected}")
     if len(page.get("events", [])) > n:
         raise AssertionError("/admin/api/audit events exceed total")
-    unauth = ctx["client"].get("/admin/api/audit", timeout=5.0)
+    unauth = ctx["client"].get("/admin/api/audit", timeout=LOOPBACK_ADMIN_TIMEOUT_S)
     if unauth.status_code != 401:
         raise AssertionError(f"/admin/api/audit 无 Key 应 401：{unauth.status_code}")
-    report = ctx["client"].get("/admin/api/report.csv", headers=auth, timeout=5.0)
+    report = ctx["client"].get("/admin/api/report.csv", headers=auth,
+                               timeout=LOOPBACK_ADMIN_TIMEOUT_S)
     if report.status_code != 200 or "text/csv" not in report.headers.get("content-type", ""):
         raise AssertionError(f"/admin/api/report.csv 异常: {report.status_code}")
     csv_rows = list(csv.reader(io.StringIO(report.content.decode("utf-8-sig"), newline="")))
@@ -926,7 +944,8 @@ def case_u5(ctx: dict[str, Any]) -> str:
         raise AssertionError(f"report.csv 行数 {len(csv_rows)} != {expected}+表头")
     if csv_rows[0][0] != "id" or csv_rows[0][5] != "route" or csv_rows[0][6] != "blocked":
         raise AssertionError(f"report.csv 表头异常: {csv_rows[0]}")
-    metrics = ctx["client"].get("/admin/api/metrics", headers=auth, timeout=5.0)
+    metrics = ctx["client"].get("/admin/api/metrics", headers=auth,
+                                timeout=LOOPBACK_ADMIN_TIMEOUT_S)
     if metrics.status_code != 200:
         raise AssertionError(f"/admin/api/metrics status={metrics.status_code}")
     agg = metrics.json()
@@ -1096,7 +1115,8 @@ def _llm_service_root(base_url: str) -> str:
 
 
 def _ring_last_record(root: str) -> dict[str, Any]:
-    records = httpx.get(f"{root}/admin/records", timeout=5.0).json()["records"]
+    records = httpx.get(f"{root}/admin/records",
+                        timeout=LOOPBACK_ADMIN_TIMEOUT_S).json()["records"]
     if not records:
         raise AssertionError(f"真实上游 {root} ring buffer 为空")
     return records[-1]
@@ -1151,6 +1171,83 @@ def _u8_adjudicated_db_scan(db_path: Path, rows: list[Any]) -> tuple[int, list[s
     return len(blob), hits
 
 
+def _u8_is_empty_reply(raw: str) -> bool:
+    """HTTP 200 回复体的「空正文」签名：剥除 AI 标识尾注（若有）后无有效正文。
+
+    覆盖两种同性质形态：content 仅为标识行（gate_final 实锤：GOVCLOUD 腿
+    「回复为空（仅标识行）」——网关对空串 content 也会追加独占一行的尾注，
+    见 outguard.label.apply_message_label）与 content 整体为空/全空白。
+    JSON 解析失败/形状异常/非字符串 content 不属本签名（返回 False，交由
+    调用方既有断言如实 FAIL，与无重试时代行为一致）。
+    """
+    try:
+        content = json.loads(raw)["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return False
+    if not isinstance(content, str):
+        return False
+    tail = f"\n{AI_LABEL}"
+    body = content[: -len(tail)] if content.endswith(tail) else content
+    return not body.strip()
+
+
+def _u8_send_bounded(
+    send: Callable[[], tuple[int, dict[str, str], list[str], str]],
+    route: str,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[int, dict[str, str], list[str], str]:
+    """U8 腿发送一次请求，对两类上游外部非确定性失败做定向有界重试。
+
+    可重试签名**仅此两种**（其余 4xx/5xx/形状异常原样返回，交调用方既有断言）：
+    - 1301 内容过滤：HTTP 400 且 body 含 contentFilter+1301（bigmodel 云端风控
+      偶发误伤外部输入/模型自身草稿）——预算 U8_CONTENT_FILTER_RETRIES；
+    - 空回复：HTTP 200 但剥除 AI 标识尾注后正文为空（云端偶发生成空内容，
+      gate_final 实锤第四种外部非确定性形态，历史留档多次出现）——预算
+      U8_EMPTY_REPLY_RETRIES。
+
+    重发同一请求=换一个采样，间隔递增（1s→2s→…）给云端冷却窗口；两类预算
+    相互独立、可任意交错（尝试总数上界 = 1 + 两预算之和，有界）；全部尝试均
+    命中**同一**签名才 FAIL，失败信息注明「上游内容过滤」/「上游空回复」。
+    成功判定语义不变：最终返回的必须是非空真实回复（调用方占位符零泄漏等
+    既有断言全保留）。这是外部服务非确定性韧性，不是掩盖网关缺陷；产品侧
+    gateway/provider 透传行为不改。
+
+    ``send``：零参可调用（= 一次 ``_send_chat``）；``sleep``：注入点（离线
+    确定性验证用，生产路径缺省 ``time.sleep``）。
+    """
+    cf_left = U8_CONTENT_FILTER_RETRIES
+    empty_left = U8_EMPTY_REPLY_RETRIES
+    status, headers, frames, raw = send()
+    while True:
+        retry_delay: float | None = None
+        if status == 400 and "contentFilter" in raw and "1301" in raw:
+            if cf_left <= 0:
+                raise AssertionError(
+                    f"{route} 腿 status=400（上游内容过滤：全部 "
+                    f"{1 + U8_CONTENT_FILTER_RETRIES} 次尝试均 400 code=1301）"
+                    f" body={raw[:200]!r}")
+            cf_left -= 1
+            retry_delay = 1.0 * (U8_CONTENT_FILTER_RETRIES - cf_left)
+            print(f"[e2e_smoke] U8 {route} 腿上游内容安全闸 400(code=1301)，"
+                  f"{retry_delay:.0f}s 后重试 {U8_CONTENT_FILTER_RETRIES - cf_left}"
+                  f"/{U8_CONTENT_FILTER_RETRIES}", flush=True)
+        elif status == 200 and _u8_is_empty_reply(raw):
+            if empty_left <= 0:
+                raise AssertionError(
+                    f"{route} 腿回复为空（仅标识行）——上游空回复：全部 "
+                    f"{1 + U8_EMPTY_REPLY_RETRIES} 次尝试剥除 AI 标识后正文均为空")
+            empty_left -= 1
+            retry_delay = 1.0 * (U8_EMPTY_REPLY_RETRIES - empty_left)
+            print(f"[e2e_smoke] U8 {route} 腿上游空回复（200 无正文），"
+                  f"{retry_delay:.0f}s 后重试 {U8_EMPTY_REPLY_RETRIES - empty_left}"
+                  f"/{U8_EMPTY_REPLY_RETRIES}", flush=True)
+        else:
+            return status, headers, frames, raw
+        sleep(retry_delay)
+        status, headers, frames, raw = send()
+
+
 def case_u8(ctx: dict[str, Any]) -> str:
     """真实大模型全链（§9 U8；批次6 T6.2 起）。
 
@@ -1159,6 +1256,9 @@ def case_u8(ctx: dict[str, Any]) -> str:
 
     - INTERNET 腿 = U1 材料（人名+2 身份证+3 手机号，脱敏后 INTERNET 出网）；
       GOVCLOUD 腿 = 低保名单材料（敏感个人信息+批量身份证 → GOVCLOUD）；
+    - 每腿对两类上游外部非确定性失败定向有界重试（_u8_send_bounded）：1301
+      内容过滤与空回复（200 剥 AI 标识后正文为空），全部尝试均命中同一签名
+      才 FAIL；非空正常回复的断言语义不变；
     - 每腿断言：回复非空（扣 AI 标识尾注）、占位符零泄漏、AI 标识三面在位
       （响应头/尾注/annotations）、上游形状透传（model=配置中性名、usage>0）、
       **上游 ring buffer 全文 == 原文脱敏版**（逐字全文 diff + bytes 级零原值）、
@@ -1200,7 +1300,7 @@ def case_u8(ctx: dict[str, Any]) -> str:
         server, thread = _start_u8_gateway(ctx, cfg_real, u8_db)
         client_u8 = httpx.Client(base_url=f"http://127.0.0.1:{U8_GATEWAY_PORT}",
                                  timeout=httpx.Timeout(U8_CLIENT_TIMEOUT_S))
-        httpx.post(f"{root}/admin/reset", timeout=5.0)
+        httpx.post(f"{root}/admin/reset", timeout=LOOPBACK_ADMIN_TIMEOUT_S)
 
         legs = [
             (U8_SESSION_INTERNET, U_TEXT, U1_SPANS, "INTERNET", internet_up, key_internet),
@@ -1210,7 +1310,19 @@ def case_u8(ctx: dict[str, Any]) -> str:
         for session, text, spans, route, upstream, key in legs:
             body = _plain_body(text, model=None)   # model 缺省 → 上游清单首项（配置中性名）
             body["max_tokens"] = U8_MAX_TOKENS
-            status, headers, frames, raw = _send_chat(client_u8, body, session, ctx)
+            # 上游两类外部非确定性失败的定向有界重试（机制与预算详见
+            # _u8_send_bounded / evals.thresholds）：1301 内容过滤（400
+            # contentFilter code=1301——bigmodel 云端风控对外部输入/模型自身
+            # 草稿的偶发误伤，gate_final 实测同腿 15 跑 14 过 1 挂）与空回复
+            # （200 但剥除 AI 标识尾注后正文为空——云端偶发生成空内容，
+            # gate_final 实锤第四种外部非确定性形态）。纯云端服务非确定性，
+            # 与网关链路无关；重发同一请求=换一个采样、间隔递增给云端冷却
+            # 窗口，整条网关链路照常全量断言。这是外部服务非确定性韧性，
+            # 不是掩盖网关缺陷；产品侧 gateway/provider 透传行为不改。全部
+            # 尝试均命中同一签名才 FAIL（失败信息注明上游内容过滤/上游空回复）；
+            # 其余 4xx/5xx 行为不变（原样 FAIL 不重试）。
+            status, headers, frames, raw = _u8_send_bounded(
+                functools.partial(_send_chat, client_u8, body, session, ctx), route)
             if status != 200:
                 raise AssertionError(f"{route} 腿 status={status} body={raw[:200]!r}")
             if headers.get("x-anongw-route") != route:
@@ -1221,11 +1333,14 @@ def case_u8(ctx: dict[str, Any]) -> str:
             message = data["choices"][0]["message"]
             content = message["content"]
             # 回复非空（扣 AI 标识尾注行）+ 占位符零泄漏 + AI 标识三面在位
+            # （空正文的有界重试与终态 FAIL 在 _u8_send_bounded，失败信息注明
+            #   「上游空回复」；此处再核非空：走到这里的 200 回复必须非空——
+            #   不变量双保险，成功判定语义不变）
             if not content.endswith(f"\n{AI_LABEL}"):
                 raise AssertionError(f"{route} 腿 AI 标识尾注缺失: {content[-40:]!r}")
             body_text = content[: -len(f"\n{AI_LABEL}")]
             if not body_text.strip():
-                raise AssertionError(f"{route} 腿回复为空（仅标识行）")
+                raise AssertionError(f"{route} 腿回复为空（仅标识行）——上游空回复")
             # 占位符零泄漏（T8.4 起=改形容忍口径）：还原正则不可见的改形残留
             # （同形括号/大小写/全半角等静默泄漏面）同被抓获——还原侧已按
             # canonical_placeholder 容错还原（masking.mapper），客户端仍出现
@@ -1248,7 +1363,8 @@ def case_u8(ctx: dict[str, Any]) -> str:
             if not record.get("auth_header_present") or record.get("auth_key_sha8") != fp:
                 raise AssertionError(f"{route} 腿 key 指纹不符: "
                                      f"{record.get('auth_key_sha8')!r} != {fp}")
-            _assert_no_raw(httpx.get(f"{root}/admin/text", timeout=5.0).content,
+            _assert_no_raw(httpx.get(f"{root}/admin/text",
+                                     timeout=LOOPBACK_ADMIN_TIMEOUT_S).content,
                            RAW_VALUES, f"llm:{root} {route}")
             print(f"[e2e_smoke] U8 {route} 腿真实回复（前 60 字）: {body_text[:60]!r}…",
                   flush=True)
@@ -1313,7 +1429,7 @@ def main() -> int:
         ctx["mock_internet"] = f"http://127.0.0.1:{MOCK_PORT_INTERNET}"
         ctx["mock_govcloud"] = f"http://127.0.0.1:{MOCK_PORT_GOVCLOUD}"
         for base in (ctx["mock_internet"], ctx["mock_govcloud"]):
-            httpx.post(f"{base}/admin/reset", timeout=5.0)
+            httpx.post(f"{base}/admin/reset", timeout=LOOPBACK_ADMIN_TIMEOUT_S)
         _start_gateway(ctx)
         # 客户端超时=健壮性护栏非性能断言（T8.3 run4 实锤：共享机负载峰值下回环
         # 新建连接可 >30s——m11 的并发超时已因「本机回环新连 ~1s」放宽至 240s，

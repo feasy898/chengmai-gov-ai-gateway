@@ -63,6 +63,7 @@ EXCLUDED_TRACKED = ("constraints.txt", "ops/clone_oss.sh")
 EXCLUDED_TOP_DIRS = frozenset({
     "data", "tmp", "out", "plan", "third_party", ".venv", "venv",
     ".git", "node_modules", "__pycache__",
+    "evidence",  # 门禁运行留档（本地工件，逐字引用 eval 原始日志含引擎名，不进公开树）
 })
 
 #: 词表自身：原样携带（导出树内 name_lint 依它自查；同坐标在 lint 侧豁免）
