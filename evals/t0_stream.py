@@ -23,6 +23,9 @@ exit 0 = 通过。检查项（对应任务单 T0.5 完成定义：对 mock 上�
    只认已知标签集）、组合改形）整段与流式逐块还原全等——
    构造样本直测，不依赖模型随机性；负例（非占位符的同形括号文本/markdown
    链接/未知占位符/前缀段剥不出已知标签或映射表外的改形）原样放行零误替；
+   **截断摘要（U8 INTERNET 腿实锤：hex 被抄短至 4–7 位）**唯一前缀命中还原，
+   歧义前缀/无关短 hex 穿透并按 NONCANON_MARK 标记（canonical / lookup /
+   StreamRestorer 同链同断言）；
 5. SSE 字节层：任意字节切块（含把多字节 UTF-8 切成两半）→ 半行缓冲解析
    逐事件全等；经 compose_chat_stream 全管线输出与整段处理全等；
 6. 密级样例 stream=true → 403 content_blocked（普通 JSON，非 SSE），上游零感知；
@@ -68,6 +71,7 @@ from gateway.app import create_app  # noqa: E402
 from gateway.mock_upstream import ECHO_MARKER, MockUpstreamServer  # noqa: E402
 from gateway.pipeline import GatewayService  # noqa: E402
 from masking.mapper import (  # noqa: E402
+    NONCANON_MARK,
     RESTORE_PATTERN,
     SessionMapper,
     canonical_placeholder,
@@ -713,6 +717,76 @@ def step_remap_mangled_forms(ctx: dict[str, Any]) -> str:
             f"{len(negatives) + len(prefix_negatives)} negatives passthrough")
 
 
+class _ForcedDigestMapper(SessionMapper):
+    """白盒：强制指定值的摘要（确定性构造截断/歧义前缀样本，m3 §5 同款先例）。"""
+
+    def __init__(self, session_id: str, key: bytes, forced: dict[str, str]) -> None:
+        super().__init__(session_id, key)
+        self._forced = forced
+
+    def _digest(self, type_value: str, normalized: str) -> str:  # noqa: ARG002 — 契约同形
+        forced = self._forced.get(normalized)
+        return forced if forced is not None else super()._digest(type_value, normalized)
+
+
+def step_remap_truncated_digest(ctx: dict[str, Any]) -> str:
+    """截断摘要三态面（U8 INTERNET 腿实锤）：唯一前缀命中→还原；歧义/无关→穿透+标记。
+
+    实锤（gate_final tmp/wf/1791053731613:684-686）：模型把〔手机号·9cfd96c0〕
+    抄成〔手机号·9cfd96〕（hex 8 位截成 6 位），canonical 查表未命中 → 原样穿透
+    到客户端（NONCANON_MARK 标记 ~noncanon）。修复 = 精确查表未命中后一步
+    「唯一前缀匹配」（digest 是身份）：恰一个已知 digest 前缀命中才还原，零个
+    或多个不可猜测、维持穿透。canonical_placeholder / SessionMapper.lookup /
+    StreamRestorer 同链，整段与流式同断言（流式跨块切块覆盖截断占位符内部）。
+    """
+    mapper = _ForcedDigestMapper("sess_remap_trunc", MASK_KEY.encode(), {
+        PHONE_B: "9cfd96c0" + "0" * 56,
+        "赵六": "abcd1234" + "0" * 56,
+        "钱七": "abcd5678" + "0" * 56,
+    })
+    mapper.placeholder_for(EntityClass.PHONE_MOBILE, PHONE_B)
+    mapper.placeholder_for(EntityClass.PERSON, "赵六")
+    mapper.placeholder_for(EntityClass.PERSON, "钱七")
+    ph = mapper.placeholder_for(EntityClass.PHONE_MOBILE, PHONE_B)[0]
+    hexpart = ph[ph.index("·") + 1:-1]
+    if hexpart != "9cfd96c0":
+        raise AssertionError(f"fixture broken: forced digest {hexpart!r}")
+    # ① 截断 1–3 位（8→7/6/5）唯一前缀命中 → 还原（整段 == 流式 1–7 字符随机切块）
+    for trunc in (hexpart[:-1], hexpart[:-2], hexpart[:-3]):
+        form = f"回电〔手机号·{trunc}〕。"
+        expected = f"回电{PHONE_B}。"
+        if mapper.restore(form) != expected:
+            raise AssertionError(f"truncated-{len(trunc)} whole-restore mismatch: "
+                                 f"{mapper.restore(form)!r}")
+        for seed in (1, 2, 3):
+            r = StreamRestorer(mapper.lookup)
+            out = "".join(r.feed(p) for p in _split_chars(form, random.Random(seed))) + r.flush()
+            if out != expected:
+                raise AssertionError(f"truncated-{len(trunc)} stream-restore(seed={seed}) "
+                                     f"mismatch: {out!r}")
+    # ② 歧义前缀（abcd 同时是赵六/钱七两条 digest 的前缀）→ 穿透+NONCANON_MARK
+    ambiguous = "〔人名·abcd〕"
+    if mapper.restore(f"经办人{ambiguous}签收。") != f"经办人{ambiguous}签收。":
+        raise AssertionError("ambiguous prefix must passthrough")
+    if tolerant_placeholder_hits(ambiguous) != [ambiguous + NONCANON_MARK]:
+        raise AssertionError(f"ambiguous prefix evidence: {tolerant_placeholder_hits(ambiguous)!r}")
+    # ③ 无关短 hex → 穿透+NONCANON_MARK
+    unrelated = "〔手机号·ef12〕"
+    if mapper.restore(f"号码{unrelated}停用。") != f"号码{unrelated}停用。":
+        raise AssertionError("unrelated short hex must passthrough")
+    if tolerant_placeholder_hits(unrelated) != [unrelated + NONCANON_MARK]:
+        raise AssertionError(f"unrelated hex evidence: {tolerant_placeholder_hits(unrelated)!r}")
+    # 回归钉：全宽摘要精确查表还原 + canonical 键形状不变（既有语义）
+    if mapper.restore(f"回电{ph}。") != f"回电{PHONE_B}。":
+        raise AssertionError("full-width exact lookup regression")
+    key = canonical_placeholder(f"手机号·{hexpart[:-2]}")
+    if key != f"〔手机号·{hexpart[:-2]}〕":
+        raise AssertionError(f"canonical truncated key shape mismatch: {key!r}")
+    return ("truncated digest (8→7/6/5) unique-prefix restore (whole == 3 chunked "
+            "streams each); ambiguous prefix & unrelated short hex passthrough with "
+            "NONCANON_MARK; full-width exact lookup + canonical shape intact")
+
+
 async def _fake_byte_chunks(data: bytes, rnd: random.Random) -> AsyncIterator[bytes]:
     """把字节串按 1–5 字节随机切块（可切进 UTF-8 多字节字符中间）。"""
     i = 0
@@ -820,6 +894,7 @@ STEPS = (
     ("remap:chunked-fuzz-300", step_remap_fuzz),
     ("remap:edge-cases", step_remap_edges),
     ("remap:mangled-forms", step_remap_mangled_forms),
+    ("remap:truncated-digest-prefix", step_remap_truncated_digest),
     ("sse:byte-level-partial-lines", step_sse_byte_layer),
     ("sse:finalize-tail-callbacks", step_sse_finalize_tail_callbacks),
 )

@@ -47,6 +47,7 @@ import threading
 import time
 import unicodedata
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -216,15 +217,66 @@ def _is_content_filter_1301(status_code: int, body_text: str) -> bool:
     return status_code == 400 and "contentFilter" in body_text and "1301" in body_text
 
 
+def _is_empty_reply_masked(raw: str) -> bool:
+    """脱敏腿「空回复」签名（与 ops/e2e_smoke._u8_is_empty_reply 同款）：HTTP 200
+    且剥除 AI 标识尾注（若有）后无有效正文。
+
+    gate_final 实锤的 U8 同款形态：云端偶发生成空 content，网关对空串也会追加
+    独占一行的标识尾注（outguard.label.apply_message_label）——客户端拿到
+    「仅标识行」。JSON 解析失败/形状异常/非字符串 content 不属本签名（返回
+    False，交由调用方既有断言如实 FAIL，与无重试时代行为一致）。
+    """
+    try:
+        content = json.loads(raw)["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return False
+    if not isinstance(content, str):
+        return False
+    tail = f"\n{AI_LABEL}"
+    body = content[: -len(tail)] if content.endswith(tail) else content
+    return not body.strip()
+
+
 def _post_chat(client: httpx.Client, url: str, payload: dict[str, Any],
-               headers: dict[str, str], *, what: str) -> httpx.Response:
+               headers: dict[str, str], *, what: str,
+               empty_reply_signature: Callable[[str], bool] | None = None,
+               sleep: Callable[[float], None] = time.sleep) -> httpx.Response:
+    """POST 一次 chat 请求；对上游外部非确定性失败做定向有界重试。
+
+    可重试签名**仅此三类**（其余 4xx/5xx/形状异常如实返回/失败）：
+    - 瞬时故障（隧道抖动/5xx）：HTTP_RETRIES 预算；
+    - 1301 内容过滤：HTTP 400 且 body 含 contentFilter+1301（bigmodel 云端
+      风控偶发误伤外部输入/模型自身草稿）——th.M8_CONTENT_FILTER_RETRIES 预算；
+    - 空回复（可选，``empty_reply_signature`` 判定为真时）：HTTP 200 但剥除
+      AI 标识尾注后正文为空（云端偶发生成空内容，gate_final 实锤第四种外部
+      非确定性形态，与 U8 同性质）——th.M8_EMPTY_REPLY_RETRIES 预算。
+
+    各预算相互独立、可任意交错（尝试总数上界 = 1 + 各预算之和，有界）；全部
+    尝试均命中**同一**签名才 FAIL，失败信息注明「上游内容过滤」/「上游空回复」。
+    成功判定语义不变（调用方占位符泄漏/评分等既有断言全保留）。这是外部服务
+    非确定性韧性，不是掩盖网关缺陷；产品侧 gateway/provider 透传行为不改。
+    ``sleep``：注入点（离线确定性验证用，生产路径缺省 ``time.sleep``）。
+    """
     last = ""
     http_retries = 0   # 瞬时故障（隧道抖动/5xx）已用重试次数
     cf_retries = 0     # 上游 1301 风控误伤已用重试次数（独立有界，间隔递增）
+    empty_retries = 0  # 上游空回复已用重试次数（独立有界，间隔递增）
     while True:
         try:
             resp = client.post(url, json=payload, headers=headers)
             if resp.status_code == 200:
+                if empty_reply_signature is not None and empty_reply_signature(resp.text):
+                    if empty_retries < th.M8_EMPTY_REPLY_RETRIES:
+                        empty_retries += 1
+                        delay = 2.0 * empty_retries        # 间隔递增（2s→4s）
+                        print(f"[m8_quality] {what}: 上游空回复（200 无正文），"
+                              f"{delay:.0f}s 后重试 {empty_retries}/{th.M8_EMPTY_REPLY_RETRIES}",
+                              flush=True)
+                        sleep(delay)
+                        continue
+                    last = (f"上游空回复（剥除 AI 标识尾注后正文为空，重试 "
+                            f"{th.M8_EMPTY_REPLY_RETRIES} 次仍为空）")
+                    break  # 全部尝试均空 → 如实 FAIL（注明上游空回复）
                 return resp
             body_text = resp.text
             last = f"status={resp.status_code} body={body_text[:160]!r}"
@@ -235,7 +287,7 @@ def _post_chat(client: httpx.Client, url: str, payload: dict[str, Any],
                     print(f"[m8_quality] {what}: 上游内容安全闸 400(code=1301)，"
                           f"{delay:.0f}s 后重试 {cf_retries}/{th.M8_CONTENT_FILTER_RETRIES}",
                           flush=True)
-                    time.sleep(delay)
+                    sleep(delay)
                     continue
                 last = (f"上游内容过滤（code=1301，重试 "
                         f"{th.M8_CONTENT_FILTER_RETRIES} 次仍命中）：{last}")
@@ -246,7 +298,7 @@ def _post_chat(client: httpx.Client, url: str, payload: dict[str, Any],
             last = f"{type(exc).__name__}: {exc}"
         if http_retries < HTTP_RETRIES:
             http_retries += 1
-            time.sleep(2.0 * http_retries)
+            sleep(2.0 * http_retries)
             continue
         break
     raise AssertionError(f"{what}: {last}")
@@ -349,7 +401,8 @@ def phase_masked(ctx: dict[str, Any]) -> str:
             resp = _post_chat(client, "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": _user_prompt(p)}],
                 "temperature": 0, "max_tokens": ANSWER_MAX_TOKENS,
-            }, {**auth, "x-anongw-session-id": session}, what=f"{p.qid}/masked")
+            }, {**auth, "x-anongw-session-id": session}, what=f"{p.qid}/masked",
+                empty_reply_signature=_is_empty_reply_masked)
             latency_ms = int((time.perf_counter() - t0) * 1000)
             route = resp.headers.get("x-anongw-route")
             assert route == p.expect_route, f"{p.qid}/masked: route {route} != {p.expect_route}"
@@ -373,11 +426,13 @@ def phase_masked(ctx: dict[str, Any]) -> str:
         assert not leaks, f"上游 ring 出现 seeded 原值（脱敏缺位）: {leaks[:5]}"
 
         # 审计：按本测试可控维度（每 QA 独立会话 ID 前缀过滤）断言——每个 QA
-        # 恰有一条「完成态」事件（flags 空 + response_preview 非空），完成态
-        # 总数 == n；不再用全表行数口径。原因：上游 1301 风控误伤的有界重试会
-        # 多写一条 upstream_status_400 透传行（pipeline 对上游非 200 如实落账，
-        # 透传行为不改）——那是外部服务非确定性的如实审计记录，不是网关缺陷，
-        # 完成态计数不受其影响。（临时库，不碰 data/audit.db）
+        # 至少一条「完成态」事件（flags 空 + response_preview 非空，按会话去重），
+        # 完成态会话总数 == n；不再用全表行数口径。原因：上游 1301 风控误伤与
+        # 空回复（_is_empty_reply_masked 签名）的有界重试会多写事件行——1301
+        # 透传行（flags=["upstream_status_400"]）与空正文行（response_preview 为
+        # 空，_safe_response_preview 对空串原样返回空）天然不计完成态；外部服务
+        # 非确定性的如实审计记录，不是网关缺陷，完成态计数不受其影响。（临时库，
+        # 不碰 data/audit.db）
         audit: SqliteAuditWriter = ctx["audit_gw"]
         deadline = time.monotonic() + 10.0
         while len(audit) < n and time.monotonic() < deadline:
@@ -391,15 +446,13 @@ def phase_masked(ctx: dict[str, Any]) -> str:
             # 预览为空，天然不计入
             return not ev.flags and bool(ev.response_preview)
 
-        done_by_session: dict[str, int] = {}
-        for _row_id, ev in rows:
-            if ev.session_id.startswith(SESSION_ID) and _is_done(ev):
-                done_by_session[ev.session_id] = done_by_session.get(ev.session_id, 0) + 1
+        done_sessions = {ev.session_id for _row_id, ev in rows
+                         if ev.session_id.startswith(SESSION_ID) and _is_done(ev)}
         for p in pairs:
-            got = done_by_session.get(f"{SESSION_ID}_{p.qid}", 0)
-            assert got == 1, f"{p.qid}: 完成态审计事件 {got} != 1"
-        total_done = sum(done_by_session.values())
-        assert total_done == n, f"审计完成态事件总数 {total_done} != {n}"
+            if f"{SESSION_ID}_{p.qid}" not in done_sessions:
+                raise AssertionError(f"{p.qid}: 完成态审计事件缺失（重试后仍无成功行）")
+        total_done = len(done_sessions)
+        assert total_done == n, f"审计完成态会话总数 {total_done} != {n}"
 
         routes = Counter(r["route"] for r in out)
         lat = sorted(r["latency_ms"] for r in out)

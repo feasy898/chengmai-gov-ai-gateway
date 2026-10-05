@@ -14,6 +14,10 @@ exit 0 = 通过。检查项（开发指令 §6 M3 eval 口径，阈值取 evals/
    →「〔主号：手机号·…〕」，U8 INTERNET 腿实锤）/组合）整段与流式还原全等；
    工具参数 JSON 内改形占位符经 restore_arguments 仍可解析且原值在位；
    非占位符文本零误替；
+3c. 截断摘要容错还原（U8 INTERNET 腿实锤）：模型把摘要抄短（hex 8 位截成
+   4–7 位，如〔手机号·9cfd96c0〕→〔手机号·9cfd96〕）——精确查表未命中后
+   「唯一前缀匹配」恰一个已知 digest 才还原；歧义前缀/无关短 hex 穿透并按
+   NONCANON_MARK 标记；整段与流式同链同断言；
 4. 工具调用还原（T2.3 补：流式 hold-to-finish）：
    - 含中文参数 JSON 的 delta 序列（arguments 被切成任意碎片、占位符跨 chunk）：
      finish 前零发出、finish 时**单个 delta** 整体还原，JSON 可解析、原值在位、
@@ -49,7 +53,12 @@ from evals.thresholds import (  # noqa: E402
     MASK_STABILITY_VALUES,
     MASK_STREAM_FUZZ_CASES,
 )
-from masking.mapper import RESTORE_PATTERN, SessionMapper  # noqa: E402
+from masking.mapper import (  # noqa: E402
+    NONCANON_MARK,
+    RESTORE_PATTERN,
+    SessionMapper,
+    tolerant_placeholder_hits,
+)
 from masking.normalize import normalize_value  # noqa: E402
 from masking.remap import MAX_PLACEHOLDER_LEN, StreamRestorer  # noqa: E402
 from masking.toolbuf import (  # noqa: E402
@@ -301,6 +310,62 @@ def step_mangled_forms() -> str:
         raise AssertionError(f"mangled tool args person not restored: {restored!r}")
     return (f"{len(forms)} known mangle forms restored (whole + 2 chunked streams each); "
             f"6 negatives passthrough; mangled placeholder in tool-args JSON still restores")
+
+
+# ── 3c. 截断摘要容错还原（U8 INTERNET 腿实锤：模型抄短 hex → 唯一前缀还原）──
+def step_truncated_digest() -> str:
+    """截断摘要三态面：唯一前缀命中 → 还原；歧义前缀 / 无关短 hex → 穿透+标记。
+
+    U8 INTERNET 腿实锤（gate_final tmp/wf/1791053731613:684-686）：模型把
+    〔手机号·9cfd96c0〕抄成〔手机号·9cfd96〕（hex 8 位截成 6 位），canonical
+    查表未命中 → 原样穿透到客户端（NONCANON_MARK 标记 ~noncanon）。修复面 =
+    精确查表未命中后一步「唯一前缀匹配」（digest 是身份）：恰一个已知 digest
+    前缀命中才还原，零个或多个不可猜测、维持穿透。digest 用强制摘要确定性
+    构造（_ForcedDigestMapper，同 §5 白盒先例），整段与流式同链同断言。
+    """
+    mapper = _ForcedDigestMapper("sess_m3_trunc", MASK_KEY.encode(), {
+        PHONE_OK: "9cfd96c0" + "0" * 56,
+        PERSON_OK: "abcd1234" + "0" * 56,
+        ADDRESS_OK: "abcd5678" + "0" * 56,
+    })
+    for etype, value in ((EntityClass.PHONE_MOBILE, PHONE_OK),
+                         (EntityClass.PERSON, PERSON_OK),
+                         (EntityClass.ADDRESS, ADDRESS_OK)):
+        mapper.placeholder_for(etype, value)
+    ph_phone = mapper.placeholder_for(EntityClass.PHONE_MOBILE, PHONE_OK)[0]
+    hexpart = ph_phone[ph_phone.index("·") + 1:-1]
+    if hexpart != "9cfd96c0":
+        raise AssertionError(f"fixture broken: forced digest {hexpart!r}")
+    # ① 截断 1–3 位（8→7/6/5）唯一前缀命中 → 还原为原值（整段 == 流式切块）
+    for trunc in (hexpart[:-1], hexpart[:-2], hexpart[:-3]):
+        form = f"联系〔手机号·{trunc}〕并回电。"
+        expected = f"联系{PHONE_OK}并回电。"
+        if mapper.restore(form) != expected:
+            raise AssertionError(f"truncated-{len(trunc)} whole-restore mismatch: "
+                                 f"{mapper.restore(form)!r}")
+        r = StreamRestorer(mapper.lookup)
+        out = "".join(r.feed(p) for p in _split_chars(form, random.Random(1))) + r.flush()
+        if out != expected:
+            raise AssertionError(f"truncated-{len(trunc)} stream-restore mismatch: {out!r}")
+    # ② 歧义前缀（abcd 同时是 人名/住址 两条 digest 的前缀）→ 不可猜测，穿透+标记
+    ambiguous = "〔人名·abcd〕"
+    if mapper.restore(f"姓名{ambiguous}在册。") != f"姓名{ambiguous}在册。":
+        raise AssertionError("ambiguous prefix must passthrough: "
+                             f"{mapper.restore(ambiguous)!r}")
+    if tolerant_placeholder_hits(ambiguous) != [ambiguous + NONCANON_MARK]:
+        raise AssertionError(f"ambiguous prefix evidence: {tolerant_placeholder_hits(ambiguous)!r}")
+    # ③ 无关短 hex（无任何 digest 以其为前缀）→ 穿透+标记
+    unrelated = "〔手机号·ef12〕"
+    if mapper.restore(f"电话{unrelated}已改。") != f"电话{unrelated}已改。":
+        raise AssertionError("unrelated short hex must passthrough")
+    if tolerant_placeholder_hits(unrelated) != [unrelated + NONCANON_MARK]:
+        raise AssertionError(f"unrelated hex evidence: {tolerant_placeholder_hits(unrelated)!r}")
+    # 回归钉：全宽摘要精确查表还原不受影响（既有语义）
+    if mapper.restore(f"联系{ph_phone}。") != f"联系{PHONE_OK}。":
+        raise AssertionError("full-width exact lookup regression")
+    return ("truncated digest (8→7/6/5) unique-prefix restore (whole == stream); "
+            "ambiguous prefix & unrelated short hex passthrough with NONCANON_MARK; "
+            "full-width exact lookup intact")
 
 
 # ── 4. 工具调用还原（T2.3：流式 hold-to-finish + 跨 chunk 切分）────────
@@ -627,6 +692,7 @@ STEPS = (
     ("mask:normalization-equivalence", step_normalize_equivalence),
     ("remap:stream-fuzz-500", step_stream_fuzz),
     ("remap:mangled-forms", step_mangled_forms),
+    ("remap:truncated-digest-prefix", step_truncated_digest),
     ("tool:hold-to-finish-core", step_tool_core),
     ("tool:cross-chunk-sweep-fuzz-multi", step_tool_cross_chunk),
     ("tool:overflow-valve-nonstream", step_tool_edges),

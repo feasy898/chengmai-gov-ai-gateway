@@ -26,6 +26,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
 
+try:  # 受管端口残留收割（每项检查前；与 gate_final 同口径，见 ops/gate_ports.py）
+    from ops.gate_ports import reap_leftover_listeners
+except ImportError:  # 脚本式调用（python ops/gate_d0.py）：ops/ 自身在 sys.path[0]
+    from gate_ports import reap_leftover_listeners  # type: ignore[no-redef]
+
 #: (显示名, 模块参数)；统一以仓库 .venv 解释器运行，cwd=仓库根
 CHECKS: list[tuple[str, list[str]]] = [
     ("name_lint", ["-m", "ops.name_lint"]),
@@ -38,6 +43,9 @@ CHECK_TIMEOUT_S = 900
 
 
 def _run_check(name: str, args: list[str]) -> bool:
+    reaped = reap_leftover_listeners()
+    if reaped:  # 项前收割（2026-10-04 gate_b4⑥ 实锤：嵌套门无收割 → 端口占用跨门级联）
+        print(f"[gate_d0] 项前端口清理: {'；'.join(reaped)}", flush=True)
     print(f"\n===== [gate_d0] RUN {name} ：{VENV_PYTHON.name} {' '.join(args)} "
           f"(cwd={REPO_ROOT}) =====", flush=True)
     try:

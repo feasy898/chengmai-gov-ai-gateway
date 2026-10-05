@@ -1114,12 +1114,39 @@ def _llm_service_root(base_url: str) -> str:
     return root[:-3] if root.endswith("/v1") else root
 
 
-def _ring_last_record(root: str) -> dict[str, Any]:
+def _ring_leg_record(root: str, key: str, route: str) -> dict[str, Any]:
+    """本腿 ring 记录：按腿专属 key 指纹（auth_key_sha8）过滤后取最后一条。
+
+    ring 是两腿共用同一服务进程的插入序缓冲；空回复/1301 的有界重试会给同一腿
+    插入多条记录，历史遗留条目也可能在本腿断言时仍在环上——按固定位置取
+    （records[-1]）在存在额外条目时错位（gate_final 实锤，tmp/wf/1791059156898：
+    INTERNET 腿断言取到 GOVCLOUD 腿名单 prompt）。腿的请求特征选型：
+
+    - 会话 ID 不可用：网关不把 x-anongw-session-id 转发上游，ring 记录
+      （gpu-services/llm_openai/service.py _RING.add）只有 ts/model/stream/
+      max_tokens/auth 指纹/messages/peer/seq 字段；
+    - prompt 前缀签名会反噬诊断：过滤键取自「期望脱敏版」，若网关脱敏本身有
+      缺陷则零匹配，全文 diff 断言被「找不到记录」遮蔽；
+    - ``auth_key_sha8`` 是记录自带的每腿稳定特征，且两腿 key 必不同（case_u8
+      前置断言）——同历史遗留同腿记录的 messages 逐字相同（占位符确定性），
+      取哪条断言全等价。过滤后恰有多条 = 含重试的多次尝试，取最后一条 =
+      最终成功尝试；零条 = 本腿请求确实未达上游，如实 FAIL 并附诊断信息。
+    断言语义不变：取到的记录仍走 _assert_upstream_messages 全文 diff。
+    """
     records = httpx.get(f"{root}/admin/records",
                         timeout=LOOPBACK_ADMIN_TIMEOUT_S).json()["records"]
-    if not records:
-        raise AssertionError(f"真实上游 {root} ring buffer 为空")
-    return records[-1]
+    fp = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+    matches = [r for r in records if r.get("auth_key_sha8") == fp]
+    if not matches:
+        tail = records[-1] if records else {}
+        tail_msgs = tail.get("messages") if isinstance(tail, dict) else None
+        tail_head = (tail_msgs[-1].get("content", "")[:60]
+                     if isinstance(tail_msgs, list) and tail_msgs and
+                     isinstance(tail_msgs[-1], dict) else "")
+        raise AssertionError(
+            f"真实上游 {root} ring 无 {route} 腿（auth_key_sha8={fp}）记录："
+            f"共 {len(records)} 条，最后一条 messages 末条 content 前 60 字={tail_head!r}")
+    return matches[-1]
 
 
 def _start_u8_gateway(ctx: dict[str, Any], cfg_real: Any,
@@ -1355,8 +1382,9 @@ def case_u8(ctx: dict[str, Any]) -> str:
                     or data["usage"]["total_tokens"] <= 0:
                 raise AssertionError(f"{route} 腿上游形状异常: model={data['model']} "
                                      f"usage={data['usage']}")
-            # 上游 ring buffer 全文 == 原文脱敏版 + key 指纹 == .env 值（两腿不同）
-            record = _ring_last_record(root)
+            # 上游 ring buffer 全文 == 原文脱敏版 + key 指纹 == .env 值（两腿不同）；
+            # 取腿按腿专属 key 指纹过滤后取最后一条（重试/遗留条目不再错位）
+            record = _ring_leg_record(root, key, route)
             expected = _expected_masked(ctx, session, text, spans, service=ctx["service_u8"])
             _assert_upstream_messages(record, expected, f"llm:{root} {route}")
             fp = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]

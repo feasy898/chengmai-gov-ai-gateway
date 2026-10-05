@@ -8,7 +8,10 @@
 
 - 会话稳定：同 session 同值 → 恒同占位符；跨 session 因 session_id 参与摘要 → 不同；
 - 归一化等价：同一实体的不同写法 → 同 normalized → 同占位符（见 masking/normalize.py）；
-- 还原：正则扫描占位符形状，查会话映射替换为原值；未知形状原样保留。
+- 还原：正则扫描占位符形状，查会话映射替换为原值；未知形状原样保留。截断摘要
+  （模型把 hex 抄短，4–7 位）在精确查表未命中后走**唯一前缀匹配**——恰一个已知
+  digest 前缀命中才还原，零个或多个维持穿透（U8 INTERNET 腿实锤增补，见
+  :meth:`SessionMapper._restore_by_digest_prefix`）。
 
 会话存储（内存 LRU + SQLite 落盘 + TTL）见 masking/session_store.py；本模块的
 SessionMapper 通过 ``on_insert`` 回调向外暴露新条目、``hydrate`` 支持从落盘行恢复，
@@ -85,7 +88,13 @@ _OPEN_VARIANTS_RE = re.compile("[" + re.escape(PLACEHOLDER_OPEN_VARIANTS) + "]")
 _CLOSE_VARIANTS_RE = re.compile("[" + re.escape(PLACEHOLDER_CLOSE_VARIANTS) + "]")
 _SEP_VARIANTS_RE = re.compile("[" + re.escape(PLACEHOLDER_SEP_VARIANTS) + "]")
 _MANGLE_NOISE_RE = re.compile(r"[\s`]+")  # 改形噪声：空白/换行/反引号
-_DIGEST_SHAPE_RE = re.compile(r"[0-9a-f]{8,12}")
+#: hex 容错面宽度：4–12 位。8–12 是**规范**宽度（:data:`DIGEST_WIDTHS`）；4–7 位
+#: 是模型**截断抄短**面（U8 INTERNET 腿实锤：〔手机号·9cfd96c0〕被抄成
+#: 〔手机号·9cfd96〕，canonical 查表未命中即穿透客户端）。截断候选能否还原由
+#: 查表侧「唯一前缀匹配」裁定（:meth:`SessionMapper._restore_by_digest_prefix`），
+#: 不可唯一还原的穿透由检测面按 :data:`NONCANON_MARK` 如实标记——放宽无害。
+#: 13 位以上（模型扩写幻觉）与 non-hex 仍一律拒绝。
+_DIGEST_SHAPE_RE = re.compile(r"[0-9a-f]{4,12}")
 _PREFIX_COLON_RE = re.compile("[" + re.escape(PLACEHOLDER_PREFIX_COLONS) + "]")
 
 #: 已知中文标签集（EntityClass 全部 label）：前缀段剥离只认它——标签含冒号段时
@@ -114,10 +123,22 @@ _BARE_DIGEST_RE = re.compile(
 NONCANON_MARK = "~noncanon"
 
 
+def _evidence_str(key: str) -> str:
+    """规范键 → 泄漏证据串；摘要宽度非规范宽度（8/10/12）时附 :data:`NONCANON_MARK`。
+
+    截断摘要（4–7 位）已进容错规范化面，但「不可唯一还原」的穿透仍会到客户端
+    ——证据串与裸形面（:func:`_bare_evidence`）同形同标记，``seen`` 去重集天然
+    合并两面命中，泄漏报告口径一致（一候选一条证据）。
+    """
+    inner = key[len(PLACEHOLDER_OPEN):len(key) - len(PLACEHOLDER_CLOSE)]
+    digest = inner.partition(PLACEHOLDER_SEPARATOR)[2]
+    return key if len(digest) in DIGEST_WIDTHS else key + NONCANON_MARK
+
+
 def _bare_evidence(label: str, digest: str) -> str:
-    """裸形命中 → 规范键形状的证据串（长度非 8–12 位者加 :data:`NONCANON_MARK`）。"""
-    canon = f"{PLACEHOLDER_OPEN}{label}{PLACEHOLDER_SEPARATOR}{digest}{PLACEHOLDER_CLOSE}"
-    return canon if len(digest) in DIGEST_WIDTHS else canon + NONCANON_MARK
+    """裸形命中 → 规范键形状的证据串（标记口径与括号面同一来源）。"""
+    return _evidence_str(
+        f"{PLACEHOLDER_OPEN}{label}{PLACEHOLDER_SEPARATOR}{digest}{PLACEHOLDER_CLOSE}")
 
 
 # ── 标签副索引键面（§三g 补丁 1）──────────────────────────────────────
@@ -181,8 +202,10 @@ def canonical_placeholder(inside: str) -> str | None:
 
     规范化四步（顺序固定）：①剥除改形噪声（空白/换行/反引号）；②按间隔号
     变体切成「标签+摘要」两段（多段/单段=不是占位符）；③摘要经 NFKC 全半角
-    归一 + 小写 + 易混字符兜底后须为 8–12 位 hex；④标签含冒号前缀段时剥至
-    已知标签（:func:`_strip_prefix_segments`，只认 :data:`KNOWN_LABELS`——
+    归一 + 小写 + 易混字符兜底后须为 4–12 位 hex（8–12 规范宽度照常；4–7 位=
+    模型截断抄短面，U8 INTERNET 腿实锤——能否还原交给查表侧唯一前缀匹配，
+    不在此处卡死）；④标签含冒号前缀段时剥至已知标签
+    （:func:`_strip_prefix_segments`，只认 :data:`KNOWN_LABELS`——
     「主号：手机号」→「手机号」；剥不出已知标签保持原样）。标签须不含任何
     括号变体。
     """
@@ -273,9 +296,10 @@ def tolerant_placeholder_hits(text: str) -> list[str]:
         if cm is not None:
             key = canonical_placeholder(text[open_at + 1:cm.start()])
             if key is not None:
-                if key not in seen:
-                    seen.add(key)
-                    out.append(key)
+                evidence = _evidence_str(key)  # 截断摘要（4–7 位）同面标记 NONCANON_MARK
+                if evidence not in seen:
+                    seen.add(evidence)
+                    out.append(evidence)
                 i = cm.end()
                 continue
         i = open_at + 1
@@ -390,17 +414,41 @@ class SessionMapper:
     def lookup(self, placeholder: str) -> str | None:
         """单条占位符 → 原值；映射表外返回 None（流式还原状态机的查找入口）。
 
-        主索引未命中时走标签副索引（§三g 补丁 1）：EN 标签的规范键按
-        ``(ascii 化标签, 摘要)`` 复查——摘要逐字相等且标签别名命中才还原，
-        两道闸任一不过即原样放行（错还原率=0 硬不变量）。
+        精确查表未命中时按序走两级容错：标签副索引（§三g 补丁 1，EN 标签改形）
+        → digest 唯一前缀匹配（截断摘要容错还原，U8 INTERNET 腿实锤增补）。
+        副索引摘要逐字相等且标签别名命中才还原；前缀匹配「恰一个」已知 digest
+        前缀命中才还原——两道闸任一不过即原样放行（错还原率=0 硬不变量）。
         """
         entry = self._by_placeholder.get(placeholder)
         if entry is not None:
             return entry.normalized
+        digest = self._digest_of(placeholder)
         token = ascii_label_token(self._digest_label(placeholder))
-        if token is None:
+        if token is not None:
+            hit = self._by_ascii_label.get((token, digest))
+            if hit is not None:
+                return hit
+        return self._restore_by_digest_prefix(digest)
+
+    def _restore_by_digest_prefix(self, digest: str) -> str | None:
+        """截断摘要容错还原（唯一前缀匹配）：恰一个已知 digest 前缀命中才还原。
+
+        真实大模型会把占位符摘要**抄短**（U8 INTERNET 腿实锤，gate_final
+        tmp/wf/1791053731613：〔手机号·9cfd96c0〕被抄成〔手机号·9cfd96〕，
+        hex 8 位被截成 6 位），canonical 键精确查表必然未命中 → 原样穿透到
+        客户端。digest 是身份（§三g 补丁 1 同款口径）：在本会话映射表中找以
+        候选 hex（≥4 位，截断更短唯一性无意义）为前缀的已知 digest——
+
+        - **恰一个** → 还原为该值（截断 1–3 位唯一命中即在此还原）；
+        - 零个（无关短 hex/幻觉）或多个（歧义前缀）→ 不可猜测，维持穿透，
+          由检测面按 :data:`NONCANON_MARK` 如实标记（泄漏报告口径不变）。
+        """
+        if len(digest) < 4:
             return None
-        return self._by_ascii_label.get((token, self._digest_of(placeholder)))
+        matches = [entry.normalized
+                   for ph, entry in list(self._by_placeholder.items())
+                   if self._digest_of(ph).startswith(digest)]
+        return matches[0] if len(matches) == 1 else None
 
     def _digest_label(self, placeholder: str) -> str:
         """占位符 → 标签段（去括号锚与摘要段）；无间隔号时返回整串（查表必未命中）。"""
