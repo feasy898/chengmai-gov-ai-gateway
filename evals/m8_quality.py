@@ -47,7 +47,10 @@ import threading
 import time
 import unicodedata
 from collections import Counter
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 from collections.abc import Callable
+=======
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 from pathlib import Path
 from typing import Any
 
@@ -83,10 +86,15 @@ AI_LABEL = "本内容由AI生成"       # config/app.yaml ai_label
 REAL_PROFILE_INTERNET = "internet_real"
 REAL_PROFILE_GOVCLOUD = "govcloud_real"
 
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 ANSWER_MAX_TOKENS = 1024         # 答案生成长度上限（答案要求简短；2026-10-03 128→1024：
                                  # 真实上游换思考型云端模型，思考段先行耗尽小预算致正文
                                  # 为空——只放宽请求预算，空回复断言与评分口径不变）
 JUDGE_MAX_TOKENS = 512           # 评分 JSON 长度上限（2026-10-03 96→512，同上因）
+=======
+ANSWER_MAX_TOKENS = 128          # 答案生成长度上限（答案要求简短）
+JUDGE_MAX_TOKENS = 96            # 评分 JSON 长度上限
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 HEALTH_TIMEOUT_S = 5.0
 CALL_TIMEOUT_S = 240.0           # 单次真实推理客户端总超时
 HTTP_RETRIES = 2                 # 瞬时故障（隧道抖动/5xx）重试次数
@@ -206,6 +214,7 @@ def _service_ready(ctx: dict[str, Any]) -> tuple[bool, str]:
 
 # ── 请求原语（显式字面量主机 + 瞬时故障重试）────────────────────────────────
 
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 def _is_content_filter_1301(status_code: int, body_text: str) -> bool:
     """上游内容安全闸签名：HTTP 400 且 body 含 code 1301 / contentFilter 字样。
 
@@ -292,15 +301,31 @@ def _post_chat(client: httpx.Client, url: str, payload: dict[str, Any],
                 last = (f"上游内容过滤（code=1301，重试 "
                         f"{th.M8_CONTENT_FILTER_RETRIES} 次仍命中）：{last}")
                 break  # 全部尝试均 1301 → 如实 FAIL（注明上游内容过滤）
+=======
+def _post_chat(client: httpx.Client, url: str, payload: dict[str, Any],
+               headers: dict[str, str], *, what: str) -> httpx.Response:
+    last = ""
+    for attempt in range(HTTP_RETRIES + 1):
+        try:
+            resp = client.post(url, json=payload, headers=headers)
+            if resp.status_code == 200:
+                return resp
+            last = f"status={resp.status_code} body={resp.text[:160]!r}"
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
             if resp.status_code < 500:
                 break  # 4xx（拦截/参数）：非瞬时，如实失败
         except httpx.TransportError as exc:
             last = f"{type(exc).__name__}: {exc}"
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
         if http_retries < HTTP_RETRIES:
             http_retries += 1
             sleep(2.0 * http_retries)
             continue
         break
+=======
+        if attempt < HTTP_RETRIES:
+            time.sleep(2.0 * (attempt + 1))
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
     raise AssertionError(f"{what}: {last}")
 
 
@@ -390,6 +415,7 @@ def phase_masked(ctx: dict[str, Any]) -> str:
         httpx.post(f"{ctx['root']}/admin/reset", timeout=5.0)
         client = httpx.Client(base_url=f"{GATEWAY_BASE}:{GATEWAY_PORT}",
                               timeout=httpx.Timeout(CALL_TIMEOUT_S))
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
         auth = {"Authorization": f"Bearer {DEMO_KEY}"}
         out: list[dict[str, Any]] = []
         for p in pairs:
@@ -397,12 +423,21 @@ def phase_masked(ctx: dict[str, Any]) -> str:
             # 审计计数按会话归属到 QA，上游 1301 风控误伤重发多写的
             # upstream_status_400 透传行不会击穿完成态计数
             session = f"{SESSION_ID}_{p.qid}"
+=======
+        auth = {"Authorization": f"Bearer {DEMO_KEY}", "x-anongw-session-id": SESSION_ID}
+        out: list[dict[str, Any]] = []
+        for p in pairs:
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
             t0 = time.perf_counter()
             resp = _post_chat(client, "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": _user_prompt(p)}],
                 "temperature": 0, "max_tokens": ANSWER_MAX_TOKENS,
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
             }, {**auth, "x-anongw-session-id": session}, what=f"{p.qid}/masked",
                 empty_reply_signature=_is_empty_reply_masked)
+=======
+            }, auth, what=f"{p.qid}/masked")
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
             latency_ms = int((time.perf_counter() - t0) * 1000)
             route = resp.headers.get("x-anongw-route")
             assert route == p.expect_route, f"{p.qid}/masked: route {route} != {p.expect_route}"
@@ -425,6 +460,7 @@ def phase_masked(ctx: dict[str, Any]) -> str:
                  if val.encode("utf-8") in blob]
         assert not leaks, f"上游 ring 出现 seeded 原值（脱敏缺位）: {leaks[:5]}"
 
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
         # 审计：按本测试可控维度（每 QA 独立会话 ID 前缀过滤）断言——每个 QA
         # 至少一条「完成态」事件（flags 空 + response_preview 非空，按会话去重），
         # 完成态会话总数 == n；不再用全表行数口径。原因：上游 1301 风控误伤与
@@ -433,10 +469,14 @@ def phase_masked(ctx: dict[str, Any]) -> str:
         # 空，_safe_response_preview 对空串原样返回空）天然不计完成态；外部服务
         # 非确定性的如实审计记录，不是网关缺陷，完成态计数不受其影响。（临时库，
         # 不碰 data/audit.db）
+=======
+        # 审计：n 行如落库（临时库，不碰 data/audit.db）
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
         audit: SqliteAuditWriter = ctx["audit_gw"]
         deadline = time.monotonic() + 10.0
         while len(audit) < n and time.monotonic() < deadline:
             time.sleep(0.1)
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
         assert audit.flush(timeout_s=5.0)
         rows = audit.fetch_all()
 
@@ -453,13 +493,21 @@ def phase_masked(ctx: dict[str, Any]) -> str:
                 raise AssertionError(f"{p.qid}: 完成态审计事件缺失（重试后仍无成功行）")
         total_done = len(done_sessions)
         assert total_done == n, f"审计完成态会话总数 {total_done} != {n}"
+=======
+        assert audit.flush(timeout_s=5.0) and len(audit) == n, \
+            f"审计行数 {len(audit)} != {n}"
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 
         routes = Counter(r["route"] for r in out)
         lat = sorted(r["latency_ms"] for r in out)
         return (f"{n} 腿经网关真实链路（路由 {dict(sorted(routes.items()))}，"
                 f"客户端零占位符/零泄漏）；上游 ring {records.get('count')} 条全文 "
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
                 f"{len(blob)} 字节零 seeded 原值；审计 {len(rows)} 行"
                 f"（完成态 {total_done} == {n}）；"
+=======
+                f"{len(blob)} 字节零 seeded 原值；审计 {len(audit)} 行；"
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
                 f"延迟 mean={sum(lat) // len(lat)}ms p95={lat[int(0.95 * (len(lat) - 1))]}ms")
     finally:
         if client is not None:

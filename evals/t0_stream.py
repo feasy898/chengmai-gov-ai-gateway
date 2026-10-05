@@ -18,6 +18,7 @@ exit 0 = 通过。检查项（对应任务单 T0.5 完成定义：对 mock 上�
    放行；完整括号对但查表未命中 → 原样放行；流末 flush 残留候选；
    **T8.4 改形形态目录**：模型对占位符 token 的已知改形（反引号包裹/内嵌、
    空白与换行插入拆开、hex 大小写/全半角转写、易混字符 O→0/l→1、同形括号
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
    〔→【[ 与间隔号 ·→・•. 转写、括号外前缀文案并入括号内且多出冒号段
    （「主号：〔手机号·…〕」→「〔主号：手机号·…〕」，U8 INTERNET 腿实锤，
    只认已知标签集）、组合改形）整段与流式逐块还原全等——
@@ -26,6 +27,11 @@ exit 0 = 通过。检查项（对应任务单 T0.5 完成定义：对 mock 上�
    **截断摘要（U8 INTERNET 腿实锤：hex 被抄短至 4–7 位）**唯一前缀命中还原，
    歧义前缀/无关短 hex 穿透并按 NONCANON_MARK 标记（canonical / lookup /
    StreamRestorer 同链同断言）；
+=======
+   〔→【[ 与间隔号 ·→・•. 转写、组合改形）整段与流式逐块还原全等——
+   构造样本直测，不依赖模型随机性；负例（非占位符的同形括号文本/markdown
+   链接/未知占位符）原样放行零误替；
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 5. SSE 字节层：任意字节切块（含把多字节 UTF-8 切成两半）→ 半行缓冲解析
    逐事件全等；经 compose_chat_stream 全管线输出与整段处理全等；
 6. 密级样例 stream=true → 403 content_blocked（普通 JSON，非 SSE），上游零感知；
@@ -71,7 +77,10 @@ from gateway.app import create_app  # noqa: E402
 from gateway.mock_upstream import ECHO_MARKER, MockUpstreamServer  # noqa: E402
 from gateway.pipeline import GatewayService  # noqa: E402
 from masking.mapper import (  # noqa: E402
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
     NONCANON_MARK,
+=======
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
     RESTORE_PATTERN,
     SessionMapper,
     canonical_placeholder,
@@ -641,6 +650,7 @@ def _mangle_forms(ph: str) -> list[tuple[str, str, str, str]]:
         ("corner-brackets", "", f"【{label_full}·{hexpart}】", ""),
         ("ascii-brackets", "", f"[{label_full}·{hexpart}]", ""),
         ("combo-worst", "", f"〔 {label_full} ・ `{hexpart.upper()}` 〕", ""),
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
         # U8 INTERNET 腿实锤（prefix-merge）：括号外前缀文案被并入括号内、多出
         # 冒号段（「主号：〔手机号·…〕」→「〔主号：手机号·…〕」）；只认已知
         # 标签集，还原=整个括号对替换为原值（并入的前缀段不保真，非 PII 噪声）
@@ -648,6 +658,8 @@ def _mangle_forms(ph: str) -> list[tuple[str, str, str, str]]:
         ("prefix-ascii-colon", "", f"{head}主号: {label_full}·{hexpart}{tail}", ""),
         ("prefix-multi-segment", "", f"{head}备用联系方式：主号：{label_full}·{hexpart}{tail}", ""),
         ("prefix-combo-noise", "", f"{head} 主号： {label_full} ・ `{hexpart}` {tail}", ""),
+=======
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
     ]
 
 
@@ -684,7 +696,10 @@ def step_remap_mangled_forms(ctx: dict[str, Any]) -> str:
         "〔本段·没有占位符〕",                  # 完整括号对、摘要非 hex
         "〔未知·deadbeef〕",                    # 规范形状、查表外
         "plain text without any brackets",      # 纯文本
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
         "〔备注：本段没有占位符〕",              # 前缀段改形、无 ·hex 摘要 → 非占位符
+=======
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
     ]
     for neg in negatives:
         if mapper.restore(neg) != neg:
@@ -693,6 +708,7 @@ def step_remap_mangled_forms(ctx: dict[str, Any]) -> str:
             continue  # 规范形状属「可辨认占位符」，检测面按泄漏口径应当报告
         if tolerant_placeholder_hits(neg):
             raise AssertionError(f"tolerant detector false positive: {neg!r}")
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
     # U8 prefix-merge 负例：前缀段剥不出已知标签 / 剥到已知标签但映射表外 →
     # 逐字放行零误替（终审闸=映射表命中）。前两者仍具占位符形状（·hex8），
     # 按泄漏口径检测面应当报告（同〔未知·deadbeef〕）
@@ -785,6 +801,14 @@ def step_remap_truncated_digest(ctx: dict[str, Any]) -> str:
     return ("truncated digest (8→7/6/5) unique-prefix restore (whole == 3 chunked "
             "streams each); ambiguous prefix & unrelated short hex passthrough with "
             "NONCANON_MARK; full-width exact lookup + canonical shape intact")
+=======
+    # canonical 单元面：规范化输出恒为规范键形状
+    key = canonical_placeholder(" 手机号 ・ `ABCDEF12` ")
+    if key != "〔手机号·abcdef12〕":
+        raise AssertionError(f"canonical normalization mismatch: {key!r}")
+    return (f"{len(_mangle_forms(ph))} known mangle forms restored byte-exact "
+            f"(whole + 3 random-chunk streams each); {len(negatives)} negatives passthrough")
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 
 
 async def _fake_byte_chunks(data: bytes, rnd: random.Random) -> AsyncIterator[bytes]:
@@ -894,7 +918,10 @@ STEPS = (
     ("remap:chunked-fuzz-300", step_remap_fuzz),
     ("remap:edge-cases", step_remap_edges),
     ("remap:mangled-forms", step_remap_mangled_forms),
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
     ("remap:truncated-digest-prefix", step_remap_truncated_digest),
+=======
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
     ("sse:byte-level-partial-lines", step_sse_byte_layer),
     ("sse:finalize-tail-callbacks", step_sse_finalize_tail_callbacks),
 )

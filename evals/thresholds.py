@@ -96,6 +96,7 @@ GATEWAY_BODY_DRAIN_MAX_BYTES = 2 * GATEWAY_BODY_MAX_BYTES  # 超限体排空上�
 M11_CONCURRENCY_REQUESTS = 50               # 并发压测请求数（会话隔离/审计不错行）
 M11_MALFORMED_TIMEOUT_S = 60.0              # 单个畸形用例客户端超时（挂死即 FAIL）
 M11_CONCURRENCY_TIMEOUT_S = 240.0           # 并发批客户端总超时（本机新连回环 ~1s/连接的环境代价已放宽）
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 
 # ── M10 端到端（U8 真实大模型腿；只增）─────────────────────────────
 U8_CONTENT_FILTER_RETRIES = 2          # 上游内容安全闸误伤模型自身草稿（GLM contentFilter code=1301，role=assistant）时每腿重试次数
@@ -106,3 +107,5 @@ U8_EMPTY_REPLY_RETRIES = 2             # 上游 200 但剥除 AI 标识尾注后
 # （也会误伤模型自身草稿）；有界重试是外部服务非确定性韧性，不是掩盖网关缺陷
 M8_CONTENT_FILTER_RETRIES = 2          # 上游内容安全闸 400(code=1301) 时每请求重试次数（间隔递增）
 M8_EMPTY_REPLY_RETRIES = 2             # 上游 200 但剥除 AI 标识尾注后正文为空（云端偶发生成空内容，与 1301 同性质的外部非确定性，gate_final 实锤同款）时每请求重试次数（间隔递增）
+=======
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972

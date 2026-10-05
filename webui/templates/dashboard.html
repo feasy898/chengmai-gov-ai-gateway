@@ -117,11 +117,17 @@
       「清除演示数据」只删 <code>sess_demo_</code> 前缀的合成事件，真实流量事件不受影响。
       切换后点本页顶部「刷新」即可看新指标（演示态与真实流量同库同规格，可同屏对照）。</p>
     <div class="demo-toolbar">
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
       <label>部门 <select id="demo-dept-name">
         {% for d in demo_depts %}<option value="{{ d.name }}">{{ d.name }}</option>{% endfor %}
       </select></label>
       <label>部门 Key <input type="password" id="demo-dept-key" autocomplete="off"
         placeholder="粘贴本部门 Key（Bearer dk_***）" style="width:14rem"></label>
+=======
+      <label>部门 Key <select id="demo-dept-key">
+        {% for d in demo_depts %}<option value="{{ d.key }}">{{ d.name }}</option>{% endfor %}
+      </select></label>
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
       <button id="demo-seed-btn">一键加载演示数据</button>
       <button id="demo-clear-btn" class="ghost">清除演示数据</button>
       <span id="demo-state" class="muted">检测中…</span>
@@ -135,7 +141,11 @@
     const $ = id => document.getElementById(id);
     const BASE = "/admin/api/demo/";
     function authHeaders() {
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
       return { "Authorization": "Bearer " + ($("demo-dept-key").value || "").trim() };
+=======
+      return { "Authorization": "Bearer " + $("demo-dept-key").value };
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
     }
     function setText(id, text, on) {
       const el = $(id);

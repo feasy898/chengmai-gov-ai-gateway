@@ -131,6 +131,7 @@ QUALITY_REPORT = REPO_ROOT / "data" / "bench" / "quality_report.json"
 GPU_TUNNEL_HEALTH_URL = "http://127.0.0.1:9004/health"
 GPU_TUNNEL_HEALTH_TIMEOUT_S = 4.0
 
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 #: 门间残留监听端口与收割函数（2026-10-04 gate_b4⑥ 实锤后抽平共用）：
 #: 见 ops/gate_ports.py——除本门顶层每项前收割外，嵌套门（gate_b* 内部的
 #: m10_e2e/m5_outguard 等）也逐项收割，端口占用不再跨门级联。
@@ -141,6 +142,13 @@ except ImportError:  # 脚本式：ops/ 自身在 sys.path[0]
 
 #: 兼容别名（本文件既有调用点沿用旧名）
 _reap_leftover_listeners = reap_leftover_listeners
+=======
+#: 门间残留监听端口（e2e :9000/:8901/:8902/:9010；m11 专用 :9012/:9013/:8911-8913）。
+#: 每项开跑前收割其上的 LISTENING 残留进程（门脚本是子进程，其异常退出路径留下的
+#: 子进程本门够不到——run2 实锤：e2e mock 就绪超时路径泄漏子进程 → 后续 m5 端点
+#: 占用 FAIL）。只收割本门九项用到的端口，不碰其他（含 :9004 隧道）。
+GATE_MANAGED_PORTS = (9000, 8901, 8902, 9010, 9012, 9013, 8911, 8912, 8913)
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 
 METRIC_MISS = "（未取到）"
 
@@ -170,6 +178,41 @@ def _preflight_tunnel() -> str:
         return f"DOWN（{type(exc).__name__}: {exc}）—— ⑦ 按其自身口径 SKIP-GPU 计过"
 
 
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
+=======
+def _reap_leftover_listeners() -> list[str]:
+    """收割九项检查所用端口上的残留 LISTENING 进程（返回「端口<-pid」注记列表）。
+
+    netstat 解析失败/无残留都安静返回；只对 GATE_MANAGED_PORTS 生效。
+    """
+    reaped: list[str] = []
+    try:
+        proc = subprocess.run(["netstat", "-ano", "-p", "tcp"],
+                              capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return reaped
+    pid_by_port: dict[int, str] = {}
+    for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[3].upper() != "LISTENING":
+            continue
+        for port in GATE_MANAGED_PORTS:
+            if parts[1].endswith(f":{port}"):
+                pid_by_port.setdefault(port, parts[4])
+                break
+    for port, pid in sorted(pid_by_port.items()):
+        if not pid.isdigit() or pid == "0":
+            continue
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", pid],
+                           capture_output=True, timeout=60)
+            reaped.append(f"{port}<-pid {pid}")
+        except (OSError, subprocess.TimeoutExpired):
+            reaped.append(f"{port}<-pid {pid}(kill 失败)")
+    return reaped
+
+
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 def _run_check(name: str, argv: list[str], timeout_s: int) -> tuple[bool, list[str], str, float]:
     interpreter = Path(argv[0]).name
     tail = " ".join(argv[1:])

@@ -81,6 +81,7 @@ class AppConfig(BaseModel):
     # 源码经 importlib 按本配置动态加载、不得硬编码；留空 = 仅体检可用、
     # PDF 导出报「引擎未配置」明确错误。
     pdf_engine_module: str = ""
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 
 
 #: 环境覆盖豁免面（审查加固）：「环境变量名」类字段不参与 ``ANONGW_<K>`` 覆盖。
@@ -89,6 +90,8 @@ class AppConfig(BaseModel):
 #: 可控或空值），管理面硬闸/掩码密钥即被静默改挂——fail-open。密钥一律只经
 #: yaml/env 原值注入，不设第二道覆盖旋钮。
 _SECRET_ENV_FIELDS = frozenset({"admin_key_env", "mask_key_env"})
+=======
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 
 
 def _override_from_env(data: dict[str, Any], env: Mapping[str, str]) -> dict[str, Any]:

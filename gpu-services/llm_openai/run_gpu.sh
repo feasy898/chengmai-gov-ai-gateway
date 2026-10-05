@@ -26,12 +26,15 @@ export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HUB_OFFLINE=1          # 权重全在本地目录；from_pretrained 不联网
 export HF_HUB_DISABLE_XET=1
 
+<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 # 后端最小鉴权 key（LM-05 收敛面，可选）：文件在位则注入 env（文件 chmod 600；
 # 值不回显、不入日志；运维亦可直接 export LLM_FORWARD_KEY 显式钉住）
 if [ -f "$HERE/forward_key" ]; then
   export LLM_FORWARD_KEY="$(cat "$HERE/forward_key")"
 fi
 
+=======
+>>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 health() { curl -sf -m 3 "http://127.0.0.1:$PORT/health" 2>/dev/null; }
 is_up() { [ -n "$(health)" ]; }
 
