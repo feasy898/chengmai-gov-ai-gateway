@@ -43,14 +43,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
 
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 try:  # 受管端口残留收割（每项检查前；与 gate_final 同口径，见 ops/gate_ports.py）
     from ops.gate_ports import reap_leftover_listeners
 except ImportError:  # 脚本式调用（python ops/gate_b3.py）：ops/ 自身在 sys.path[0]
     from gate_ports import reap_leftover_listeners  # type: ignore[no-redef]
 
-=======
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 #: 启动本门的解释器（⑥ 既有门回归用：该门自身契约即「系统 python 任意 cwd」）
 GATE_PYTHON = sys.executable or "python"
 
@@ -109,12 +106,9 @@ _EXTRA_VALIDATORS = {
 
 
 def _run_check(name: str, argv: list[str], timeout_s: int) -> tuple[bool, list[str]]:
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
     reaped = reap_leftover_listeners()
     if reaped:  # 项前收割（2026-10-04 gate_b4⑥ 实锤：嵌套门无收割 → 端口占用跨门级联）
         print(f"[gate_b3] 项前端口清理: {'；'.join(reaped)}", flush=True)
-=======
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
     interpreter = Path(argv[0]).name
     tail = " ".join(argv[1:])
     print(f"\n===== [gate_b3] RUN {name} ：{interpreter} {tail} "

@@ -16,7 +16,6 @@ from recognizers.semantic.adapter import get_semantic_adapter
 
 
 def detect_full(text: str) -> list[Finding]:
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
     """规则层 + 语义层合并结果（span 升序）；fid 恒空串，由调用方按请求编号。
 
     规则层 findings 同时传给语义层作 **judge 脱敏依据**（审查加固）：LLM-judge
@@ -26,10 +25,5 @@ def detect_full(text: str) -> list[Finding]:
     """
     findings = detect(text)
     findings.extend(get_semantic_adapter().detect(text, rule_findings=findings))
-=======
-    """规则层 + 语义层合并结果（span 升序）；fid 恒空串，由调用方按请求编号。"""
-    findings = detect(text)
-    findings.extend(get_semantic_adapter().detect(text))
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
     findings.sort(key=lambda f: (f.start, f.end, f.type.value))
     return findings

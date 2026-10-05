@@ -26,15 +26,10 @@ python -m venv .venv
 
 # 2) 配置
 cp .env.example .env                           # 至少填写 MASK_KEY（32 字节 hex）
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 #   演示部门 key：明文写在部署交付物 .env.example 的注释里，也以常量形式存在于
 #   仓内 evals/ops 离线自测与演示脚本中（本地模式/CI 需要它通过本地鉴权）；
 #   config/dept_keys.yaml 只存其 sha256，页面不渲染任何 key 明文——
 #   生产部署必须更换哈希（安全注记见 §6）
-=======
-#   演示部门 key（config/dept_keys.yaml 只存 sha256，明文仅演示用）：
-#   县政府办 dk_1a2b3c4d / 民政局 dk_5e6f7a8b / 某镇 dk_9c0d1e2f
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 
 # 3) 起两路 mock 上游（:8901 互联网 / :8902 政务云；Windows 下用两个终端分别执行）
 ./.venv/Scripts/python -m gateway.mock_upstream --host 127.0.0.1 --port 8901
@@ -53,14 +48,9 @@ cp .env.example .env                           # 至少填写 MASK_KEY（32 字�
 体验（含身份证/手机的请求 → 上游只见占位符 → 客户端拿到还原答案）：
 
 ```bash
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 DEPT_KEY=<本部门演示 key，见 .env.example 注释>
 curl http://127.0.0.1:9000/v1/chat/completions \
   -H "Authorization: Bearer $DEPT_KEY" -H "Content-Type: application/json" \
-=======
-curl http://127.0.0.1:9000/v1/chat/completions \
-  -H "Authorization: Bearer dk_1a2b3c4d" -H "Content-Type: application/json" \
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
   -d '{"model":"mock-chat","messages":[{"role":"user","content":"干部张三，身份证460022199003071234，电话13800138000，帮我看下低保材料"}]}'
 ```
 
@@ -122,7 +112,6 @@ docker compose up       # 起 mock-internet(:8901) / mock-govcloud(:8902) / gate
 - `/v1/chat/completions` 与 `/internal/*` 均需部门 Key（`Authorization: Bearer dk_***`）；
   `/internal/*` 响应含识别明细与还原原文，只应经本机管理面（127.0.0.1）或
   受控内网访问，**不得暴露公网**。
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 - 会话与部门绑定：会话首次使用即归属到该部门，其他部门 Key 复用该
   `session_id`（含 `/internal/restore` 还原）一律 403——占位符映射无法被
   跨部门反查还原。
@@ -138,7 +127,3 @@ docker compose up       # 起 mock-internet(:8901) / mock-govcloud(:8902) / gate
   真值密钥（`MASK_KEY`、上游 key、admin key、judge key）只经环境变量 / `.env`
   注入，不入任何配置文件与代码；演示部门 key 为**测试夹具明文**（见上条：
   `.env.example` 注释与仓内 `evals/`、`ops/` 脚本常量），生产部署必须更换。
-=======
-- 审计库只存脱敏内容：入库前硬闸断言 + 全库文件 bytes 级扫描双保险；
-  密钥只经环境变量 / `.env` 注入，不入任何配置文件与代码。
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972

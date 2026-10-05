@@ -54,10 +54,7 @@ SSE 检查额外起进程内 mock 上游与临时端口）。
 from __future__ import annotations
 
 import asyncio
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 import hashlib
-=======
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 import importlib
 import io
 import json
@@ -310,13 +307,9 @@ def check_webui_material_text(app: Any) -> str:
     return "白名单外 404；注入版 docx text 含埋注段且与生成器构造面逐字一致"
 
 
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 #: 聊天页探针（T5.2 双屏对比页）：双栏 + 两 API 端点 + route 头 + SSE 客户端标记。
 #: 审查加固后页面不再渲染演示 Key 明文（dk_* 不入页面/源码）——「部门 Key 选择器」
 #: 探针改为部门名选择 + 密钥输入框（同一覆盖意图：携带部门 Key 的交互面在位）。
-=======
-#: 聊天页探针（T5.2 双屏对比页）：双栏 + 两 API 端点 + route 头 + SSE 客户端标记
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 _CHAT_PROBES: tuple[str, ...] = (
     "上游实际收到",                 # 右栏标题（§10 场景1）
     "/v1/chat/completions",
@@ -326,12 +319,8 @@ _CHAT_PROBES: tuple[str, ...] = (
     "text/event-stream",            # SSE 流式客户端标记
     "[DONE]",
     "x-anongw-session-id",          # 会话续接（多轮稳定脱敏）
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
     "民政局",                       # 演示部门选择器（部门名渲染）
     'id="dept-key-input"',          # 部门 Key 密钥输入框（Key 明文不进页面）
-=======
-    "dk_5e6f7a8b",                  # 演示部门 Key 选择器（民政局）
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 )
 
 
@@ -485,7 +474,6 @@ def check_webui_dashboard_initial(app: Any) -> str:
     return "空库零态：200 + 三指标卡 + 三 SVG 容器 + 明细空态提示"
 
 
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 def check_webui_dashboard_loopback_only(app: Any) -> str:
     """看板回环闸（审查加固回归钉）：非回环 client → 403 错误信封；回环 → 200。"""
     async def run() -> str:
@@ -543,8 +531,6 @@ def check_admin_key_hard_gate() -> str:
     return asyncio.run(run())
 
 
-=======
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 DEMO_KEY_T52 = "dk_5e6f7a8b"          # 民政局（.env.example 演示明文，哈希在 config/dept_keys.yaml）
 CHAT_SSE_TEXT = f"居民{PERSON}的身份证号{ID_A}，手机号{PHONE_A}，请核对低保申领材料。"
 PHONE_A_T52 = PHONE_A                  # PHONE_A = "13800138000"（模块夹具，同归一化参考）
@@ -779,11 +765,8 @@ def main() -> int:
     _record("场景材料 text 端点（载入聊天）", lambda: check_webui_material_text(app))
     _record("聊天页双屏（/webui/chat，T5.2）", lambda: check_webui_chat_page(app))
     _record("看板空库零态（/webui/dashboard）", lambda: check_webui_dashboard_initial(app))
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
     _record("看板回环闸（非回环 403 / 回环 200）", lambda: check_webui_dashboard_loopback_only(app))
     _record("管理面 admin key 硬闸（部门 Key 401 / admin 200）", lambda: check_admin_key_hard_gate())
-=======
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
     _record("inspect docx（FileReport 契约）", lambda: check_inspect_docx(app))
     _record("export docx（X-Report-Id + 零残留）", lambda: check_export_docx(app))
     _record("xlsx 隐藏列体检+删列导出", lambda: check_xlsx_hidden_col(app))

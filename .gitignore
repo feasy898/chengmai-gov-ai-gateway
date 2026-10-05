@@ -44,9 +44,6 @@ out/
 
 # 安全门禁（mimosa）hook 运行态/缓存：本地工件，不进仓库
 .mimosa/
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 
 # 门禁运行留档（eval 原始日志逐字引用，本地工件不进仓库；name_lint/export 同口径排除）
 evidence/
-=======
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972

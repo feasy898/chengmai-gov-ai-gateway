@@ -57,7 +57,6 @@ _DIGEST_SEPARATOR = "\x1f"
 # 容错还原的判定链：候选括号对 → 剥噪声规范化 → 规范键查会话映射表 →
 # **命中才替换**。结构〔标签·hex8-12〕本身足够特异，加上映射表命中这道
 # 终审闸，普通文本（【注·见附件】、markdown 链接等）不可能被误替。
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 #
 # 前缀段并入（U8 INTERNET 腿实锤增补）：模型还会把占位符**括号外的前缀文案**
 # 挪进括号内——「主号：〔手机号·9cfd96c0〕」→「〔主号：手机号·9cfd96c0〕」，
@@ -67,21 +66,16 @@ _DIGEST_SEPARATOR = "\x1f"
 # （KNOWN_LABELS，剥不出已知标签不剥）——普通〔中文：…〕文本不会被误还原
 # （映射表命中终审闸不变；并入的前缀段视为模型排版噪声，随括号对一并被
 # 替换为原值，不参与正文保真）。
-=======
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 
 #: 括号与间隔号的同形变体（模型转写常见面；命中映射表才替换，放宽无害）
 PLACEHOLDER_OPEN_VARIANTS = "〔【〖［["
 PLACEHOLDER_CLOSE_VARIANTS = "〕】〗］]"
 PLACEHOLDER_SEP_VARIANTS = "·・•‧⋅﹒．."
 
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 #: 前缀段分隔冒号（全/半角）：模型把括号外前缀文案并入括号内的分段符
 #: （U8 INTERNET 腿实测为全角「：」：〔主号：手机号·9cfd96c0〕）
 PLACEHOLDER_PREFIX_COLONS = "：:"
 
-=======
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 #: 改形候选最大扫描窗（字符）：规范形状 ≤32（标签2-3 + hex8-12），容忍反引号/
 #: 空白/换行改形放宽到 48；流式缓冲上限（remap.MAX_PLACEHOLDER_LEN）与之同源
 PLACEHOLDER_TOLERANT_MAX_LEN = 48
@@ -94,7 +88,6 @@ _OPEN_VARIANTS_RE = re.compile("[" + re.escape(PLACEHOLDER_OPEN_VARIANTS) + "]")
 _CLOSE_VARIANTS_RE = re.compile("[" + re.escape(PLACEHOLDER_CLOSE_VARIANTS) + "]")
 _SEP_VARIANTS_RE = re.compile("[" + re.escape(PLACEHOLDER_SEP_VARIANTS) + "]")
 _MANGLE_NOISE_RE = re.compile(r"[\s`]+")  # 改形噪声：空白/换行/反引号
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 #: hex 容错面宽度：4–12 位。8–12 是**规范**宽度（:data:`DIGEST_WIDTHS`）；4–7 位
 #: 是模型**截断抄短**面（U8 INTERNET 腿实锤：〔手机号·9cfd96c0〕被抄成
 #: 〔手机号·9cfd96〕，canonical 查表未命中即穿透客户端）。截断候选能否还原由
@@ -202,15 +195,11 @@ def _strip_prefix_segments(label: str) -> str:
         return label
     tail = _PREFIX_COLON_RE.split(label)[-1]
     return tail if tail in KNOWN_LABELS else label
-=======
-_DIGEST_SHAPE_RE = re.compile(r"[0-9a-f]{8,12}")
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 
 
 def canonical_placeholder(inside: str) -> str | None:
     """候选括号内文本 → 规范占位符键（``〔标签·hex〕``）；不可规范化返回 ``None``。
 
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
     规范化四步（顺序固定）：①剥除改形噪声（空白/换行/反引号）；②按间隔号
     变体切成「标签+摘要」两段（多段/单段=不是占位符）；③摘要经 NFKC 全半角
     归一 + 小写 + 易混字符兜底后须为 4–12 位 hex（8–12 规范宽度照常；4–7 位=
@@ -219,11 +208,6 @@ def canonical_placeholder(inside: str) -> str | None:
     （:func:`_strip_prefix_segments`，只认 :data:`KNOWN_LABELS`——
     「主号：手机号」→「手机号」；剥不出已知标签保持原样）。标签须不含任何
     括号变体。
-=======
-    规范化三步（顺序固定）：①剥除改形噪声（空白/换行/反引号）；②按间隔号
-    变体切成「标签+摘要」两段（多段/单段=不是占位符）；③摘要经 NFKC 全半角
-    归一 + 小写 + 易混字符兜底后须为 8–12 位 hex。标签须不含任何括号变体。
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
     """
     compact = _MANGLE_NOISE_RE.sub("", inside)
     if not compact:
@@ -239,10 +223,7 @@ def canonical_placeholder(inside: str) -> str | None:
     digest = unicodedata.normalize("NFKC", digest).lower().translate(_DIGEST_CONFUSABLE)
     if not _DIGEST_SHAPE_RE.fullmatch(digest):
         return None
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
     label = _strip_prefix_segments(label)
-=======
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
     return f"{PLACEHOLDER_OPEN}{label}{PLACEHOLDER_SEPARATOR}{digest}{PLACEHOLDER_CLOSE}"
 
 
@@ -291,7 +272,6 @@ def tolerant_placeholder_hits(text: str) -> list[str]:
     泄漏检测面（比 RESTORE_PATTERN 宽）：还原正则不可见的改形残留（静默泄漏）
     也能抓到。真实大模型腿的「占位符零泄漏」断言以此为准——改形残留只要形状
     可辨即算泄漏，无论是否仍在会话映射表内。
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 
     两条扫描面（§三g 补丁 2 后）：
 
@@ -305,10 +285,6 @@ def tolerant_placeholder_hits(text: str) -> list[str]:
     """
     out: list[str] = []
     seen: set[str] = set()
-=======
-    """
-    out: list[str] = []
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
     i, n = 0, len(text)
     while i < n:
         m = _OPEN_VARIANTS_RE.search(text, i)
@@ -320,7 +296,6 @@ def tolerant_placeholder_hits(text: str) -> list[str]:
         if cm is not None:
             key = canonical_placeholder(text[open_at + 1:cm.start()])
             if key is not None:
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
                 evidence = _evidence_str(key)  # 截断摘要（4–7 位）同面标记 NONCANON_MARK
                 if evidence not in seen:
                     seen.add(evidence)
@@ -334,12 +309,6 @@ def tolerant_placeholder_hits(text: str) -> list[str]:
         if evidence not in seen:
             seen.add(evidence)
             out.append(evidence)
-=======
-                out.append(key)
-                i = cm.end()
-                continue
-        i = open_at + 1
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
     return out
 
 

@@ -25,7 +25,6 @@
 /internal/* 调试端点（审查 §A1）：复用与 /v1/chat/completions 同一部门 Key 鉴权
 （Authorization: Bearer <dept_key>），未命中 → 401——响应含 Finding.raw/还原原文，
 绝不无鉴权暴露；生产部署另须仅经本地管理面/内网访问（见 README 安全注记）。
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 会话与部门绑定（审查加固）：会话首次使用即归属到该部门（/v1/chat 与
 /internal/anonymize 先到先得；/internal/restore 只认属主部门，他部门 403）——
 占位符映射虽在 masking_map 存归一化原值，借他部门 session_id 的还原链就此封死；
@@ -34,10 +33,6 @@
 形状与鉴权口径见 gateway/admin_api.py 模块文档；配置 admin key
 （env 名 ``cfg.admin_key_env``，缺省 ``ANONGW_ADMIN_KEY``）后只认该 key——
 部门 Key 不再放行管理面（审查加固：横向读审计/切演示态面收敛）。
-=======
-/admin/api/* 管理面查询端点（T5.1）：同为部门 Key 鉴权，只读审计库（脱敏预览），
-形状与鉴权口径见 gateway/admin_api.py 模块文档。
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 
 落库形态（T1.3）：不注入时审计走 SQLite 写队列（cfg.audit_db）、会话映射走
 SessionStore（cfg.session_db，TTL=cfg.session_ttl_h，lifespan 挂清理协程）——
@@ -55,10 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 import re
-=======
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -106,14 +98,11 @@ log = get_logger(__name__)
 #: 会话 TTL 清理协程的运行间隔（秒）
 CLEANUP_INTERVAL_S = 300.0
 
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 #: 客户端自带 session id 的形态闸（审查加固：请求头/请求体里的 ``x-anongw-session-id``
 #: 直接作会话存储键，须限字符集与长度——防控制字符注入响应头/审计，且令
 #: masking_map 行数有界可清；网关自生成的 ``sess_`` 形态天然通过）。
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
-=======
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 #: 文件通道错误码（§5.6 错误信封复用面；413/400/422 映射见 filechannel/errors.py 口径）
 CODE_UNSUPPORTED_FILE = "unsupported_file_type"
 CODE_FILE_PARSE = "file_parse_error"
@@ -391,7 +380,6 @@ def create_app(
         if not isinstance(body, dict):
             return _error_response(400, CODE_BAD_REQUEST, "request body must be a JSON object")
 
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
         # 4) 标识：session 可由客户端携带（多轮稳定脱敏），request 每请求新生成；
         #    客户端自带值过形态闸（限字符集/长度，防头注入与无界键喷洒）
         client_session = request.headers.get("x-anongw-session-id")
@@ -399,10 +387,6 @@ def create_app(
             return _error_response(400, CODE_BAD_REQUEST,
                                    "x-anongw-session-id must match [A-Za-z0-9._-]{1,128}")
         session_id = client_session or deps.new_session_id()
-=======
-        # 4) 标识：session 可由客户端携带（多轮稳定脱敏），request 每请求新生成
-        session_id = request.headers.get("x-anongw-session-id") or deps.new_session_id()
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
         request_id = deps.new_request_id()
 
         # 5) 主链路（流式 / 非流式分流；校验与错误信封两形态一致）
@@ -528,7 +512,6 @@ def create_app(
         session_id = body.get("session_id")
         if not isinstance(session_id, str) or not session_id:
             session_id = deps.new_session_id()
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
         elif not SESSION_ID_RE.fullmatch(session_id):
             return _error_response(400, CODE_BAD_REQUEST,
                                    "session_id must match [A-Za-z0-9._-]{1,128}")
@@ -540,8 +523,6 @@ def create_app(
             if owner is not None and owner != dept:
                 return _error_response(403, CODE_UNAUTHORIZED,
                                        "session_id 不属于当前部门（会话与部门绑定，跨部门还原被拒绝）")
-=======
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
         mapper = service.registry.get(session_id)
         return JSONResponse({"session_id": session_id, "restored": mapper.restore(body["text"])})
 

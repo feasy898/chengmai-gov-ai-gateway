@@ -27,14 +27,10 @@
 （部门 Key 鉴权，口径对齐 T5.1 管理面；看板页面板经这三个端点切换演示态。）
 
 不做登录（演示模式，M9 spec）；样式朴素但结构清晰。材料为合成演示数据
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 （seeded 冻结值），不含任何真实个人信息。演示部门 **Key 明文不进页面**
 （审查加固：页面不渲染任何 key 明文，使用者自行粘贴；本地演示明文见
 .env.example 注释与 evals/ops 离线自测脚本，服务端只存 sha256）；
 ``/webui/dashboard`` 仅对本机回环请求渲染（审查加固）。
-=======
-（seeded 冻结值），不含任何真实个人信息。
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 """
 from __future__ import annotations
 
@@ -44,10 +40,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request, Response
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 from fastapi.responses import JSONResponse
-=======
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 from fastapi.templating import Jinja2Templates
 
 from benchmark.generator.materials import (
@@ -62,10 +55,7 @@ from benchmark.generator.materials import (
     build_materials,
 )
 from common.config import REPO_ROOT
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 from gateway.models import ApiError, ErrorBody
-=======
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 from webui.dashboard import (
     PAGE_SIZE_DEFAULT,
     PAGE_SIZES,
@@ -131,7 +121,6 @@ _MATERIAL_CONTENT_TYPES = {
     ".pdf": "application/pdf",
 }
 
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
 #: 演示部门清单（审查加固：**只含部门名，不含 Key 明文**——demo key 不再渲染进
 #: 免鉴权页面/源码/公开文档；聊天页与看板页由使用者在密钥输入框自行粘贴本部门
 #: Key，浏览器端携带调 /v1/* 与 /internal/*。本地模式的演示明文见 .env.example
@@ -147,16 +136,6 @@ DEMO_DEPTS: tuple[dict[str, str], ...] = (
 #: （client=127.0.0.1）不受影响。生产如需远程看板，请置于受控反代/内网之后）。
 _LOCAL_CLIENT_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1"})
 
-=======
-#: 演示部门 Key（明文与 .env.example 注释一致；config/dept_keys.yaml 只存 sha256）。
-#: 演示模式无登录（M9 spec），聊天页浏览器端携带部门 Key 调 /v1/* 与 /internal/*。
-DEMO_DEPTS: tuple[dict[str, str], ...] = (
-    {"name": "县政府办", "key": "dk_1a2b3c4d"},
-    {"name": "民政局", "key": "dk_5e6f7a8b"},
-    {"name": "某镇", "key": "dk_9c0d1e2f"},
-)
-
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
 
 def _materialize(filename: str) -> bytes:
     """物化白名单演示材料并回传字节（幂等：同构建器双构建字节级一致）。
@@ -216,7 +195,6 @@ def mount(app: FastAPI) -> None:
 
         数据服务端直读审计存储（``request.app.state.audit``，内存表与 SQLite
         写队列两种形态均适配）；分页/聚合纯 Python 内存完成，不新增 SQL 面。
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
         仅本机回环可访问（审查加固）：无登录形态下不向非回环请求渲染审计
         元数据/占位符预览；远程访问一律 403 错误信封。
         """
@@ -228,9 +206,6 @@ def mount(app: FastAPI) -> None:
                     message="审计看板仅限本机访问（127.0.0.1）；远程访问请经受控管理面",
                 )).model_dump(),
                 status_code=403)
-=======
-        """
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
         events = read_events(request.app.state.audit)
         view = summarize(events)
         page_view = paginate(events, page, page_size)

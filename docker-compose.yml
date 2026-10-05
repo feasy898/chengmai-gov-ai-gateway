@@ -67,14 +67,10 @@ services:
     volumes:
       - ".:/app"
     ports:
-<<<<<<< 8340533e2268ad9f14f101eb696538bea1e8d9ab
       # 审查加固：网关（含 /internal/* 还原面与管理面）只发布到宿主回环——
       # 演示 key 属本地演示凭据，不得把需部门 Key 的端点暴露到 0.0.0.0；
       # 远程访问请经受控反代/内网，并配置 ANONGW_ADMIN_KEY（见 README.public.md §6）。
       - "127.0.0.1:9000:9000"
-=======
-      - "9000:9000"
->>>>>>> 47048f64cf6ee1fff8757a2565bf59d4c0003972
     command: >
       sh -c "pip install --no-cache-dir -U pip setuptools &&
              pip install --no-cache-dir -e . &&
