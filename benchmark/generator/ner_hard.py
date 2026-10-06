@@ -205,6 +205,23 @@ def _build_ner_case(case_id: str, template: str, name: str, address: str,
     }
 
 
+# 静态钉板负例（2026-10-06 m10_e2e db_file_scan 事故：上下文锚定曾把
+# 「居民电话登记表」的「电话登记」当 PERSON——姓氏门+停用词修复后，此组永久钉住）
+_STATIC_NEGATIVES = [
+    "请核对居民电话登记表",
+    "村民电话登记工作已部署",
+    "申请材料清单及审核意见",
+    "户主信息与家庭成员关系证明",
+]
+
+
+def _static_negative_cases(start_id: int) -> list[dict]:
+    return [
+        {"case_id": f"neg_static_{i:03d}", "text": t, "entities": []}
+        for i, t in enumerate(_STATIC_NEGATIVES, start=start_id)
+    ]
+
+
 def build_ne_hard(seed: int = SEED, outdir: str | None = None) -> list[dict]:
     """生成 ne_hard.jsonl 评测集，返回评测行列表。"""
     rng = random.Random(seed)
@@ -234,6 +251,8 @@ def build_ne_hard(seed: int = SEED, outdir: str | None = None) -> list[dict]:
                        for c in cases)
         (out / "ne_hard.jsonl").write_text(lines, encoding="utf-8")
         (out / "cases" / "ne_hard.jsonl").write_text(lines, encoding="utf-8")
+    cases.extend(_static_negative_cases(900))
+
 
     return cases
 

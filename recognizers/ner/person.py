@@ -68,6 +68,13 @@ _STOPWORDS = frozenset({
     "严格", "金融", "金额", "余额", "其余", "石头", "石油", "白天", "白色",
     "王国", "夏天", "谢谢", "许可", "肖像", "董事", "付款", "高端", "林业",
     "万一", "陆地", "向上", "向下", "时效", "现金", "合同", "合作",
+    # 公文字段词（2026-10-06 m10_e2e db_file_scan 暴露：上下文锚定曾把
+    # 「居民电话登记表」的「电话登记」当 PERSON，通用词进 seen_values 后
+    # 全库扫描必中——姓氏门+本表双保险）
+    "电话", "登记", "名单", "公示", "信息", "材料", "证明", "申请", "审核",
+    "意见", "情况", "说明", "编号", "号码", "记录", "工作", "时间", "地点",
+    "单位", "身份", "证件", "家庭", "成员", "关系", "人口", "户数", "地址",
+    "地区", "区域", "辖区", "社区", "小组", "以下", "如下", "尚未", "已经",
     "派出所", "指挥部", "办公室", "工作站", "服务站", "居委会",
 })
 
@@ -83,10 +90,14 @@ def detect_person(text: str, taken: list[tuple[int, int]]) -> list[Finding]:
     if not text:
         return findings
 
-    # 1) 上下文锚定（高置信度 0.9）
+    # 1) 上下文锚定（高置信度 0.9，姓氏门：首字须为姓氏表姓/复姓前缀——
+    #    「居民电话登记表」类字段词曾借此路径混入）
+    _surname_chars = set("".join(_SINGLE_SURNAMES)) | {cs[0] for cs in _COMPOUND_SURNAMES}
     for m in _CONTEXT_RE.finditer(text):
         name = m.group("name")
         if name in _STOPWORDS:
+            continue
+        if name[0] not in _surname_chars:
             continue
         start = m.start("name")
         end = start + len(name)
